@@ -1,0 +1,107 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  body {
+    @apply bg-[#0a0d14] text-slate-200 antialiased;
+    font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+    overscroll-behavior: none;
+  }
+}
+
+@layer components {
+  .panel {
+    @apply bg-panel border border-edge rounded-xl;
+  }
+  .btn {
+    @apply px-3 py-2 rounded-lg border border-edge bg-panel2 text-slate-200 text-sm font-medium
+           hover:bg-[#232b3d] active:scale-[0.98] transition select-none
+           disabled:opacity-35 disabled:pointer-events-none;
+  }
+  .btn-on {
+    @apply bg-slate-100 text-slate-900 border-slate-100 hover:bg-white;
+  }
+  .lbl {
+    @apply text-[10px] uppercase tracking-[0.14em] text-slate-500 font-semibold;
+  }
+}
+
+/* Range inputs: dark track, bright thumb, consistent across engines. */
+input[type='range'] {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 22px;
+  background: transparent;
+  cursor: pointer;
+}
+input[type='range']::-webkit-slider-runnable-track {
+  height: 5px;
+  border-radius: 999px;
+  background: #232b3d;
+}
+input[type='range']::-moz-range-track {
+  height: 5px;
+  border-radius: 999px;
+  background: #232b3d;
+}
+input[type='range']::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 15px;
+  height: 15px;
+  margin-top: -5px;
+  border-radius: 50%;
+  background: var(--thumb, #e2e8f0);
+  border: 2px solid #0a0d14;
+  box-shadow: 0 0 8px var(--thumb-glow, transparent);
+}
+input[type='range']::-moz-range-thumb {
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  background: var(--thumb, #e2e8f0);
+  border: 2px solid #0a0d14;
+  box-shadow: 0 0 8px var(--thumb-glow, transparent);
+}
+input[type='range']:disabled {
+  opacity: 0.3;
+}
+
+/* Party Mode mix fader: chunky enough for a child's finger. */
+.kid-slider {
+  height: 46px;
+}
+.kid-slider::-webkit-slider-runnable-track {
+  height: 16px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, rgba(34, 211, 238, 0.35), rgba(244, 114, 182, 0.35));
+}
+.kid-slider::-moz-range-track {
+  height: 16px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, rgba(34, 211, 238, 0.35), rgba(244, 114, 182, 0.35));
+}
+.kid-slider::-webkit-slider-thumb {
+  width: 40px;
+  height: 40px;
+  margin-top: -12px;
+  border-radius: 50%;
+  background: #ffffff;
+  border: 3px solid #0a0d14;
+  box-shadow: 0 0 18px rgba(255, 255, 255, 0.4);
+}
+.kid-slider::-moz-range-thumb {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background: #ffffff;
+  border: 3px solid #0a0d14;
+  box-shadow: 0 0 18px rgba(255, 255, 255, 0.4);
+}
