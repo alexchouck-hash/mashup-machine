@@ -1137,8 +1137,11 @@ export class Macros {
     }, (0.002 + SWAP_FADE) * 1000);
 
     if (on) {
-      // A button that does nothing is the worst failure this could have.
-      this.bumpLayers = this.ensureDrums();
+      // Bump does NOT switch drums on. It boosts what is already playing — the
+      // deck path as well as the drum bus — so a bump with no beats running is
+      // still a real low-end lift on the songs, not a dead button. Forcing
+      // layers on made the pad start music the user had not asked for, which is
+      // a far worse surprise than a subtler effect.
       this.unsubSidechain = e.transport.onStep(this.onSidechainStep);
       this.bumpOn = true;
       // Lift the songs now rather than waiting for the first kick, or the pad

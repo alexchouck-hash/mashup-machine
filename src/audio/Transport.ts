@@ -5,6 +5,8 @@ const LOOKAHEAD_MS = 25;
 const SCHEDULE_AHEAD = 0.12;
 /** Per-beat phase correction ceiling. Below the flam threshold, so inaudible. */
 const MAX_PHASE_CORRECTION = 0.004;
+/** Past this the grid is audibly wrong, so snap onto it rather than creep. */
+const SNAP_THRESHOLD = 0.025;
 
 /**
  * 16th-note clock for the beat machine.
@@ -91,7 +93,21 @@ export class Transport {
           const beat = this.stepDuration * 4;
           let err = want - this.nextTime;
           err -= Math.round(err / beat) * beat;
-          this.nextTime += Math.max(-MAX_PHASE_CORRECTION, Math.min(MAX_PHASE_CORRECTION, err));
+
+          if (Math.abs(err) > SNAP_THRESHOLD) {
+            // ACQUIRE. A 4 ms-per-beat nudge is a drift tracker, not a way to
+            // find the beat: half a beat out at 100 bpm is 300 ms, which would
+            // take ~75 beats — 45 seconds — to walk off. Anything this far out
+            // is already audibly wrong, so jump straight onto the grid and take
+            // one discontinuity instead of a minute of being out of time.
+            let target = this.nextTime + err;
+            // Never schedule into the past; that would fire a burst of steps.
+            while (target < this.ctx.currentTime + 0.005) target += beat;
+            this.nextTime = target;
+          } else {
+            // TRACK. Small and inaudible, purely to cancel accumulating drift.
+            this.nextTime += Math.max(-MAX_PHASE_CORRECTION, Math.min(MAX_PHASE_CORRECTION, err));
+          }
         }
       }
 

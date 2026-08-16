@@ -8,6 +8,14 @@ const clamp = (v: number, lo: number, hi: number) => (v < lo ? lo : v > hi ? hi 
 /** Exponential sweep, so filter knobs feel linear to the ear. */
 const expMap = (t: number, from: number, to: number) => from * Math.pow(to / from, t);
 
+/**
+ * How long a nominally-playing deck may sit motionless before we assume the
+ * platter is stranded. Long enough that a legitimately paused-then-played deck
+ * or a slow scratch release never trips it; short enough that a child does not
+ * stand there wondering why the record stopped.
+ */
+const STALL_SEC = 0.6;
+
 /** Auto-gain target, dBFS. Roughly streaming-service loudness. */
 const TARGET_LOUDNESS_DB = -14;
 
@@ -79,6 +87,8 @@ export class Deck {
   stereoWidth = 0;
   /** A finger is on this platter. Set at the gesture boundaries only. */
   scratching = false;
+  /** ctx time the playhead stopped moving while nominally playing, or 0. */
+  private stalledSince = 0;
 
   private pathBoth: GainNode;
   private pathMusic: GainNode;
@@ -415,8 +425,25 @@ export class Deck {
   private onWorkletMessage(m: { type: string; frame?: number; playing?: boolean; length?: number }): void {
     switch (m.type) {
       case 'pos': {
+        const prev = this.positionFrames;
         this.positionFrames = m.frame ?? 0;
         this.posUpdatedAt = this.engine.ctx.currentTime;
+
+        // Stall watchdog. A deck that reads as playing, is not under a finger,
+        // and has not moved for STALL_SEC is stuck — the worklet is holding a
+        // platter nobody is going to release. Free it rather than leave a dead
+        // deck on screen; a spurious scratchOff on a healthy deck is a no-op.
+        if (this.playing && !this.scratching && Math.abs(this.positionFrames - prev) < 2) {
+          if (this.stalledSince === 0) this.stalledSince = this.engine.ctx.currentTime;
+          else if (this.engine.ctx.currentTime - this.stalledSince > STALL_SEC) {
+            this.stalledSince = 0;
+            console.warn('[deck] stalled while playing — forcing the platter back');
+            this.node.port.postMessage({ type: 'scratchOff', play: true });
+            this.node.port.postMessage({ type: 'play' });
+          }
+        } else {
+          this.stalledSince = 0;
+        }
         if (m.playing !== undefined && m.playing !== this.playing) {
           this.playing = m.playing;
           this.engine.notify();
@@ -600,12 +627,23 @@ export class Deck {
     this.node.port.postMessage({ type: 'scratchRate', value: rate });
   }
 
-  /** Release. `play` omitted means "restore whatever the deck is now". */
+  /**
+   * Release. `play` omitted means "restore whatever the deck is now".
+   *
+   * Posts UNCONDITIONALLY, even when this side already believes it is not
+   * scratching. That guard used to be an early return, and it turned a
+   * transient disagreement between this flag and the worklet into a permanent
+   * one: a macro and a finger overlapping can leave the worklet holding a
+   * dead-stopped platter while `scratching` reads false here, and then the only
+   * call that could free it refuses to send. The deck sits frozen, silent, and
+   * reporting `playing: true`, with nothing in the UI able to recover it.
+   * An extra scratchOff is free — the worklet drops it when not scratching.
+   */
   scratchEnd(play?: boolean): void {
-    if (!this.scratching) return;
+    const wasScratching = this.scratching;
     this.scratching = false;
     this.node.port.postMessage({ type: 'scratchOff', play });
-    this.engine.notify();
+    if (wasScratching) this.engine.notify();
   }
 
   /** How lazily the platter spins back up after a release, in seconds. */
