@@ -17,6 +17,22 @@ const MASTER_HEADROOM = 0.5;
 /** How far the bass-swap assist ducks the outgoing deck's low band. */
 const BASS_SWAP_MAX_DB = 15;
 
+/** How often the link re-checks the followers against the leader. */
+const LINK_INTERVAL_MS = 200;
+/** Beats of error past which a jump beats waiting for a rate offset to close it. */
+const LINK_SNAP_BEATS = 0.25;
+/**
+ * Rate offset per beat of error.
+ *
+ * Sized from what has to be FIXED, not from what feels gentle: a loop wrap can
+ * throw the follower ~30 ms out, which is right at the flam threshold and so
+ * plainly audible. At 0.4 a 0.05-beat error asks for the full 2% trim and closes
+ * in about 1.5 s. An earlier value of 0.02 asked for 0.1% and would have taken
+ * THIRTY SECONDS — measured drifting at a steady −30 ms and never recovering,
+ * which is indistinguishable from no sync at all.
+ */
+const LINK_GAIN = 0.4;
+
 /**
  * The mixer. One master bus; every sound source is an input to it.
  *
@@ -79,8 +95,9 @@ export class AudioEngine {
 
   crossfade = 0.5;
   masterVolume = 1;
-  /** Sync: beats locked and both platters scratch together. */
+  /** Sync: the follower deck is held continuously on the leader's beat grid. */
   linkDecks = false;
+  private linkTimer: number | null = null;
 
   recording = false;
   recordStartedAt = 0;
@@ -317,7 +334,12 @@ export class AudioEngine {
    */
   setLink(on: boolean): void {
     this.linkDecks = on;
-    if (on) this.lockToLouder();
+    if (on) {
+      this.lockToLouder();
+      this.startLinkLoop();
+    } else {
+      this.stopLinkLoop();
+    }
     this.notify();
   }
 
@@ -356,9 +378,82 @@ export class AudioEngine {
     this.syncBeatTempo();
   }
 
-  /** Decks a gesture on `deck` should drive: both when linked, else just it. */
+  /**
+   * Decks a gesture on `deck` drives: ALWAYS every loaded deck.
+   *
+   * Owner's call, and it overrides the earlier "sync off means independent"
+   * rule for scratching specifically — grabbing one record and having the other
+   * carry on is the thing that sounds broken to everyone but a working DJ. Sync
+   * still governs the BEAT lock; it no longer governs the platters.
+   */
   scratchGroup(deck: Deck): Deck[] {
-    return this.linkDecks ? this.decks.filter((d) => d.loaded) : [deck];
+    const all = this.decks.filter((d) => d.loaded);
+    return all.length ? all : [deck];
+  }
+
+  /* ------------------------------------------------------- continuous link */
+
+  /**
+   * Hold the followers on the leader's grid, continuously.
+   *
+   * setLink() aligning once is not sync, it is a starting gun: two decks running
+   * off independently-estimated BPMs drift apart within seconds, and any seek,
+   * scratch or hook jump breaks it outright. This runs while linked and keeps
+   * pulling them back.
+   *
+   * Phase is corrected with a sub-percent RATE offset rather than a seek — 0.4%
+   * is under a tenth of a semitone and inaudible, whereas seeking every few
+   * seconds is a stutter. Only a gross error (over a quarter beat, i.e. already
+   * audibly wrong) is worth the jump.
+   */
+  private holdLink(): void {
+    if (!this.linkDecks || !this.ready) return;
+    const leader = this.louderDeck();
+    if (!leader?.analysis || !leader.playing) return;
+
+    for (const d of this.decks) {
+      // A platter under a hand owns itself; so does a deck with nothing to sync.
+      if (d === leader || !d.analysis || !d.playing || d.scratching) {
+        d.setPhaseTrim(0);
+        continue;
+      }
+      if (leader.scratching) {
+        d.setPhaseTrim(0);
+        continue;
+      }
+
+      // Keep tempo matched, but only when it has actually drifted — writing it
+      // every tick would fight a hand on the tempo fader.
+      if (Math.abs(d.effectiveBpm - leader.effectiveBpm) > 0.05) d.matchTempo(leader);
+
+      const lead = leader.beatPhaseNow();
+      const follow = d.beatPhaseNow();
+      if (lead == null || follow == null) continue;
+
+      let err = lead - follow; // in beats
+      if (err > 0.5) err -= 1;
+      else if (err < -0.5) err += 1;
+
+      if (Math.abs(err) > LINK_SNAP_BEATS) {
+        d.alignPhaseTo(leader);
+        d.setPhaseTrim(0);
+      } else {
+        // Proportional pull. Small errors close over a few seconds, silently.
+        d.setPhaseTrim(err * LINK_GAIN);
+      }
+    }
+  }
+
+  private startLinkLoop(): void {
+    if (this.linkTimer !== null) return;
+    this.linkTimer = window.setInterval(() => this.holdLink(), LINK_INTERVAL_MS);
+  }
+
+  private stopLinkLoop(): void {
+    if (this.linkTimer === null) return;
+    window.clearInterval(this.linkTimer);
+    this.linkTimer = null;
+    for (const d of this.decks) d.setPhaseTrim(0);
   }
 
   /* -------------------------------------------------------------- crossfade */

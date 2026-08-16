@@ -16,6 +16,16 @@ const expMap = (t: number, from: number, to: number) => from * Math.pow(to / fro
  */
 const STALL_SEC = 0.6;
 
+/**
+ * Ceiling on the link's phase-correction rate offset.
+ *
+ * 2% is a third of a semitone, held only for the second or so it takes to close
+ * the gap — the same order a DJ nudges a platter by, and far less objectionable
+ * than the alternatives: a seek is a stutter, and a gentler ceiling simply never
+ * catches up (0.4% left a 30 ms error uncorrected for half a minute).
+ */
+const MAX_PHASE_TRIM = 0.02;
+
 /** Auto-gain target, dBFS. Roughly streaming-service loudness. */
 const TARGET_LOUDNESS_DB = -14;
 
@@ -89,6 +99,8 @@ export class Deck {
   scratching = false;
   /** ctx time the playhead stopped moving while nominally playing, or 0. */
   private stalledSince = 0;
+  /** Transient rate offset holding a linked deck on the leader's grid. */
+  private phaseTrim = 0;
 
   private pathBoth: GainNode;
   private pathMusic: GainNode;
@@ -254,7 +266,7 @@ export class Deck {
   get positionSecNow(): number {
     if (!this.playing) return this.positionSec;
     const elapsed = Math.max(0, this.engine.ctx.currentTime - this.posUpdatedAt);
-    const rate = 1 + this.tempoPercent / 100;
+    const rate = (1 + this.tempoPercent / 100) * (1 + this.phaseTrim);
     return Math.min(this.durationSec, this.positionSec + elapsed * rate);
   }
 
@@ -548,7 +560,25 @@ export class Deck {
   }
 
   private pushRate(): void {
-    this.node.port.postMessage({ type: 'rate', value: 1 + this.tempoPercent / 100 });
+    const rate = (1 + this.tempoPercent / 100) * (1 + this.phaseTrim);
+    this.node.port.postMessage({ type: 'rate', value: rate });
+  }
+
+  /**
+   * A sub-percent rate offset used to walk this deck's phase onto the leader's
+   * while the decks are linked. Deliberately separate from tempoPercent: this is
+   * a transient correction, not a tempo the user chose, so it must not move the
+   * fader, the BPM readout, or what Sync matches against.
+   *
+   * Correcting phase this way rather than by seeking is what makes a held sync
+   * inaudible — 0.4% is under a tenth of a semitone and no one hears it, while a
+   * seek every few seconds would be a stutter.
+   */
+  setPhaseTrim(trim: number): void {
+    const v = clamp(trim, -MAX_PHASE_TRIM, MAX_PHASE_TRIM);
+    if (Math.abs(v - this.phaseTrim) < 1e-5) return;
+    this.phaseTrim = v;
+    this.pushRate();
   }
 
   /** Match the partner's effective BPM. May exceed the fader range; readout shows it. */
