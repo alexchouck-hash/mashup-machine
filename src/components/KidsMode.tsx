@@ -3,6 +3,7 @@ import type { CSSProperties, ReactNode } from 'react';
 import { engine } from '../audio/AudioEngine';
 import type { Deck } from '../audio/Deck';
 import { OCTAVE_LABELS } from '../audio/melodyLooper';
+import { MELODY_VOICES } from '../audio/melodyVoices';
 import { JAMS, prewarmJams, renderJam, type JamSpec } from '../audio/jamFactory';
 import { downloadBlob, recordingFilename } from '../audio/wav';
 import { useEngineVersion } from '../hooks/useEngine';
@@ -1066,6 +1067,24 @@ function KeysRow() {
       legend={
         <>
           <span className="legend">Keys</span>
+          {/* The instrument. Icons carry it for a child who cannot read the
+              words, exactly as the drum pack switch does. */}
+          <div className="seg seg--tight" role="group" aria-label="Instrument">
+            {MELODY_VOICES.map((v, i) => (
+              <button
+                key={v.name}
+                onClick={() => bm.setVoice(i)}
+                data-on={bm.voiceIndex === i ? 'true' : 'false'}
+                aria-pressed={bm.voiceIndex === i}
+                aria-label={v.name}
+                title={v.name}
+                className="seg-btn seg-btn--tight"
+              >
+                <span aria-hidden="true">{v.emoji}</span>
+                <span className="seg-txt hidden sm:inline">{v.name}</span>
+              </button>
+            ))}
+          </div>
           {/* Low / Mid / High. A seven-year-old does not read "octave 4". */}
           <div className="seg seg--tight" role="group" aria-label="How high">
             {OCTAVE_LABELS.map((label, i) => (

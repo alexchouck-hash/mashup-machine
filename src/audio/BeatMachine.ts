@@ -3,6 +3,7 @@ import { clap, hat, kick, openHat, snare, sub, subRootHz } from './drums';
 import { BOOM_SLOT, DRUM_PACKS, PAD_COUNT, PAD_LABELS, padVoice, type DrumPack } from './drumPacks';
 import { hzFor, progressionFor, stab, triadSemitones } from './melody';
 import { MelodyLooper, anchorKey } from './melodyLooper';
+import { MELODY_VOICES } from './melodyVoices';
 import { GridClock, TakeLooper, type Take, type TakeHooks, type TakeVoice } from './takeLooper';
 
 export type DrumLayer = 'kick' | 'snare' | 'hats' | 'bass' | 'melody';
@@ -181,6 +182,17 @@ export class BeatMachine {
 
   setAutoTune(on: boolean): void {
     this.keys.autoTune = on;
+    this.engine.notify();
+  }
+
+  /** Which of MELODY_VOICES the keyboard plays. */
+  get voiceIndex(): number {
+    return this.keys.voiceIndex;
+  }
+
+  setVoice(i: number): void {
+    const n = MELODY_VOICES.length;
+    this.keys.voiceIndex = ((i % n) + n) % n;
     this.engine.notify();
   }
 

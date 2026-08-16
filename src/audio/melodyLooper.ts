@@ -1,11 +1,13 @@
 import type { AudioEngine } from './AudioEngine';
-import { hzFor, pluck, scaleOf } from './melody';
+import { hzFor, scaleOf } from './melody';
+import { MELODY_VOICES, playVoiceSample } from './melodyVoices';
 import { GridClock, TakeLooper, type Take, type TakeHooks, type TakeVoice, type Tap } from './takeLooper';
 import type { KeyMode } from './types';
 
 /**
  * The keyboard surface: the SAME loop pedal as the beat pad, configured with a
- * 5 s idle window, a pluck voice, and two assists the performer may refuse.
+ * 5 s idle window, four switchable voices, and two assists the performer may
+ * refuse.
  *
  *   AUTO-TUNE       snaps a played note into the song's key
  *   AUTO-BEAT-MATCH snaps timing to the grid
@@ -121,6 +123,8 @@ export class MelodyLooper {
   beatMatch = true;
   /** Index into OCTAVE_LABELS. */
   octaveIndex = 1;
+  /** Index into MELODY_VOICES. Read live by the voice table on every note. */
+  voiceIndex = 0;
 
   private engine: AudioEngine;
 
@@ -130,15 +134,23 @@ export class MelodyLooper {
     const voice: TakeVoice<number> = {
       play: (ctx, dest, time, midi, gain, vel) => {
         if (!Number.isFinite(midi)) return;
+        // Read the voice LIVE, never captured: switching instrument re-voices
+        // every committed take, exactly as switching a drum pack does.
+        const v = MELODY_VOICES[this.voiceIndex] ?? MELODY_VOICES[0];
+
         // hzFor's own midi arithmetic, fed the note's own octave, so there is no
         // second copy of the equal-temperament formula in this repo.
         const hz = hzFor(((midi % 12) + 12) % 12, 0, Math.floor(midi / 12) - 1);
         const beat = 60 / (this.engine.transport.bpm || 120);
         // Notes shorten as the tempo rises, so a fast song does not turn a
         // melody into a drone.
-        const dur = clamp(beat * 0.55, 0.12, 0.5);
-        const level = 0.3 * clamp(gain, 0, 4) * (0.4 + 0.6 * clamp(vel, 0, 1));
-        pluck(ctx, dest, time, hz, dur, level);
+        const dur = clamp(beat * v.holdBeats, 0.12, v.maxSec);
+        const level = 0.3 * v.gain * clamp(gain, 0, 4) * (0.4 + 0.6 * clamp(vel, 0, 1));
+
+        // Sample first; synthesis is the fallback, so a stripped deployment or a
+        // kit still decoding degrades to a tone rather than to silence.
+        if (playVoiceSample(ctx, dest, time, v, midi, level, dur)) return;
+        v.synth(ctx, dest, time, hz, dur, level);
       },
       // The note IS the identity: two takes playing the same note at the same
       // instant merge, but a chord across takes survives.
