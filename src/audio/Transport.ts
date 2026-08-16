@@ -7,6 +7,8 @@ const SCHEDULE_AHEAD = 0.12;
 const MAX_PHASE_CORRECTION = 0.004;
 /** Past this the grid is audibly wrong, so snap onto it rather than creep. */
 const SNAP_THRESHOLD = 0.025;
+/** Floor on rateScale, so a stopped platter cannot divide the grid by zero. */
+const MIN_RATE_SCALE = 0.05;
 
 /**
  * 16th-note clock for the beat machine.
@@ -47,8 +49,21 @@ export class Transport {
     this.ctx = ctx;
   }
 
+  /**
+   * Grid speed multiplier, driven by a scratch. 1 is normal, 0 is a stopped
+   * platter. The beat machine has no playhead to drag, but it has a GRID — so
+   * scaling that is what makes the drums wind down with the record instead of
+   * marching on through a scratch.
+   */
+  rateScale = 1;
+
   get stepDuration(): number {
-    return 60 / this.bpm / 4;
+    return 60 / this.bpm / 4 / Math.max(MIN_RATE_SCALE, this.rateScale);
+  }
+
+  /** Below this the platter is stopped; the grid freezes rather than crawling. */
+  get frozen(): boolean {
+    return this.rateScale < MIN_RATE_SCALE;
   }
 
   get barDuration(): number {
@@ -81,6 +96,13 @@ export class Transport {
 
   private tick(): void {
     if (!this.running) return;
+    if (this.frozen) {
+      // A stopped platter stops the beat. Hold nextTime against the clock so the
+      // grid resumes from where it stopped instead of firing a burst of catch-up
+      // steps the moment the hand lets go.
+      this.nextTime = Math.max(this.nextTime, this.ctx.currentTime + 0.02);
+      return;
+    }
     while (this.nextTime < this.ctx.currentTime + SCHEDULE_AHEAD) {
       // Once per beat, nudge the grid toward the music. The correction is
       // capped at 4 ms — far below the ~20 ms flam threshold, so it is

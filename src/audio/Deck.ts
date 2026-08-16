@@ -629,6 +629,8 @@ export class Deck {
       frame: this.positionSecNow * this.sampleRate,
       velocity: 0,
     });
+    // A grab stops the record, and the beat stops with it.
+    this.engine.setScratchVelocity(0);
     this.engine.notify();
   }
 
@@ -645,6 +647,7 @@ export class Deck {
     if (!this.scratching) return;
     this.node.port.postMessage({ type: 'scratchJog', frame: positionSec * this.sampleRate });
     this.node.port.postMessage({ type: 'scratchRate', value: rate });
+    this.engine.setScratchVelocity(rate);
   }
 
   /**
@@ -655,6 +658,7 @@ export class Deck {
   scratchRate(rate: number): void {
     if (!this.scratching) return;
     this.node.port.postMessage({ type: 'scratchRate', value: rate });
+    this.engine.setScratchVelocity(rate);
   }
 
   /**
@@ -673,6 +677,10 @@ export class Deck {
     const wasScratching = this.scratching;
     this.scratching = false;
     this.node.port.postMessage({ type: 'scratchOff', play });
+    // Checked AFTER clearing the flag, so the last platter released is the one
+    // that hands the grid back. The transport re-acquires phase on its next
+    // beat, so the drums come back in time rather than wherever they stopped.
+    this.engine.releaseScratchVelocity();
     if (wasScratching) this.engine.notify();
   }
 

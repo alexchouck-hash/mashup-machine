@@ -318,6 +318,30 @@ export class AudioEngine {
     return this.ctx.currentTime + (1 - phase) * (60 / bpm);
   }
 
+  /**
+   * Ride the beat grid on a scratch. The drums have no playhead to drag, so the
+   * gesture scales their GRID instead — a stopped platter stops the beat, a slow
+   * one slows it. Without this the drums march on through a scratch and the
+   * whole gesture stops sounding like one performance.
+   */
+  setScratchVelocity(v: number): void {
+    if (!this.ready) return;
+    const mag = Math.abs(Number.isFinite(v) ? v : 1);
+    this.transport.rateScale = Math.min(2, mag);
+  }
+
+  /**
+   * Hand the grid back, but only once NO platter is still held — two decks
+   * scratch together, and the first release must not restore the beat under a
+   * hand that is still moving. Phase is not corrected here: the transport's own
+   * snap re-acquires on the next beat, which is what makes it exit in sync.
+   */
+  releaseScratchVelocity(): void {
+    if (!this.ready) return;
+    if (this.decks.some((d) => d.scratching)) return;
+    this.transport.rateScale = 1;
+  }
+
   /** Follow the anchor deck's tempo while the beat is running. */
   syncBeatTempo(): void {
     if (!this.ready || !this.transport.running) return;
