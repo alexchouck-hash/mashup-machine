@@ -373,11 +373,25 @@ function SongTile({ deck, color }: { deck: Deck; color: string }) {
             </div>
             <button
               disabled={!hookReady}
-              onClick={() => deck.playHook()}
+              // A toggle, not a one-way trip. It lit up to say the loop was on
+              // and then had no path back, so the catchiest bit could be started
+              // and never stopped.
+              onClick={() => {
+                if (deck.loopStartSec != null) {
+                  deck.setLoopRegion(null, null);
+                  deck.setLoop(false);
+                } else {
+                  deck.playHook();
+                }
+              }}
               data-on={deck.loopStartSec != null ? 'true' : 'false'}
               aria-pressed={deck.loopStartSec != null}
-              aria-label="Hook"
-              title="Loop the catchiest repeated bit"
+              aria-label={deck.loopStartSec != null ? 'Stop looping the hook' : 'Loop the hook'}
+              title={
+                deck.loopStartSec != null
+                  ? 'Stop looping — play the rest of the song'
+                  : 'Loop the catchiest repeated bit'
+              }
               className="key"
             >
               {/* Repeat-ONE, not repeat. Echo's pad is 🔁, and two identical
