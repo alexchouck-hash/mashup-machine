@@ -290,6 +290,31 @@ Two config traps cost real time here, both now pinned in the repo:
   Windows `path.join()` content glob matches nothing. The config builds its
   globs with forward slashes.
 
+## Long-term: build your own packs
+
+Owner directive, recorded here so it shapes decisions now rather than being
+retrofitted later: **a user should be able to build their own beat pack and their
+own harmoniser (keyboard) pack** — adding their own samples, or picking from the
+ones that ship.
+
+This is not a Phase 5 nicety; it is a constraint on how packs are modelled today.
+Two things follow immediately:
+
+- **A pack must be data, not code.** If `drumPacks.ts` and the keyboard voices are
+  plain descriptions — pad name, sample reference, root pitch, envelope — then a
+  user-built pack is the same shape as a shipped one, and the UI that plays one
+  plays both. If packs are hand-written functions, user packs need a second engine.
+- **A user sample needs the same treatment as a shipped one.** Decoded per sample
+  rate, cached, bounded in length, with a synthesis fallback when it is missing —
+  and stored locally (IndexedDB) so it survives a reload without ever being
+  uploaded, which the privacy promise on the start screen requires.
+
+The licensing asymmetry is worth stating too: samples WE ship must be
+redistributable (see `docs/SAMPLES.md`), but samples a user adds to their own
+device are theirs and carry no such constraint — provided the app never uploads
+or redistributes them. That is another reason the "never leaves this device" rule
+is load-bearing rather than decorative.
+
 ## Roadmap
 
 - **Phase 2 — done.** Beat machine as a third source on the master bus, FX and

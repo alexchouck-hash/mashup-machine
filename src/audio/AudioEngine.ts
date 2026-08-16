@@ -16,6 +16,11 @@ export type CrossfadeAssign = 'A' | 'B' | null;
 const MASTER_HEADROOM = 0.5;
 /** How far the bass-swap assist ducks the outgoing deck's low band. */
 const BASS_SWAP_MAX_DB = 15;
+/**
+ * How far a NON-owning deck is cut when the bass is pinned by hand. Deeper than
+ * the automatic duck on purpose: this one is meant to be heard as a decision.
+ */
+const BASS_PIN_DB = 24;
 
 /** How often the link re-checks the followers against the leader. */
 const LINK_INTERVAL_MS = 200;
@@ -105,6 +110,9 @@ export class AudioEngine {
    */
   linkDecks = true;
   private linkTimer: number | null = null;
+
+  /** Deck id that owns the low end, or 'auto' to follow the crossfader. */
+  bassOwner: 'auto' | string = 'auto';
 
   recording = false;
   recordStartedAt = 0;
@@ -511,8 +519,56 @@ export class AudioEngine {
    * occupy the same space. This is the single biggest cause of a mashup turning
    * to mud, and it is entirely automatic.
    */
+  /**
+   * Pin the low end to one deck, or hand it back to the crossfader.
+   *
+   * Distinct from the automatic swap below, and both earn their place: the
+   * automatic one is DEFENSIVE, stopping two kicks from turning to mud as you
+   * cross. This one is a PERFORMANCE move — song A's bassline under song B's
+   * vocal, then flipped. It is the transition every DJ does by hand, and it is
+   * the whole reason a mashup sounds deliberate rather than accidental.
+   */
+  setBassOwner(owner: 'auto' | string): void {
+    this.bassOwner = owner;
+    this.applyBassSwap();
+    this.notify();
+  }
+
+  /** Flip the low end to the other deck. Auto lands on whichever is quieter. */
+  swapBass(): void {
+    const loaded = this.decks.filter((d) => d.loaded);
+    if (loaded.length < 2) return;
+    if (this.bassOwner === 'auto') {
+      // From auto, give the bass to the deck NOT currently carrying it, which is
+      // the one the crossfader is ducking — that is the audible change.
+      const leader = this.louderDeck() ?? loaded[0];
+      const other = loaded.find((d) => d !== leader) ?? loaded[0];
+      this.setBassOwner(other.id);
+      return;
+    }
+    const current = loaded.find((d) => d.id === this.bassOwner);
+    const next = loaded.find((d) => d !== current);
+    this.setBassOwner(next ? next.id : 'auto');
+  }
+
   applyBassSwap(): void {
     if (!this.ready) return;
+
+    // A pinned owner overrides the crossfader entirely: one deck keeps its low
+    // end, every other deck loses it, wherever the fader happens to be.
+    if (this.bassOwner !== 'auto') {
+      const pinned = this.decks.some((d) => d.id === this.bassOwner);
+      if (pinned) {
+        for (const deck of this.decks) {
+          deck.setAssistLowDb(deck.id === this.bassOwner ? 0 : -BASS_PIN_DB);
+        }
+        return;
+      }
+      // The pinned deck was unloaded or swapped out; fall back rather than leave
+      // every deck's low end cut with nothing owning it.
+      this.bassOwner = 'auto';
+    }
+
     const t = this.crossfade;
     for (const deck of this.decks) {
       let duckDb = 0;

@@ -87,6 +87,45 @@ const KIT: Record<string, string> = {
   vinyl_backspin: 'vinyl_backspin',
   vinyl_rewind: 'vinyl_rewind',
   vinyl_hiss: 'vinyl_hiss',
+
+  // Acoustic kit pieces, for a rock pack.
+  kick_heavy: 'drum_heavy_kick',
+  kick_acoustic: 'drum_bass_hard',
+
+  // Melodic voices. Guitar and choir cannot be convincingly synthesized, so
+  // these are the real thing — same CC0 source, same chain of title.
+  guitar: 'guit_e_fifths',
+  guitar_chord: 'guit_em9',
+  choir: 'ambi_choir',
+  bell: 'elec_bell',
+  chime: 'elec_chime',
+  synth_bass: 'bass_trance_c',
+};
+
+/**
+ * The pitch a sample was RECORDED at, as a MIDI note number, for the voices that
+ * get transposed across a keyboard.
+ *
+ * Without this a melody voice cannot know how far to shift: playing `guitar` at
+ * playbackRate 1 gives whatever note the guitarist happened to play, not the note
+ * the child pressed. Names carry the answer where the source library states it —
+ * `bass_trance_c` and friends are in C, `guit_em9` is an E minor 9 chord.
+ *
+ * Absent an entry, a voice should treat the sample as untuned and either avoid
+ * transposing it or accept that it is a texture rather than a pitch.
+ *
+ * A caution worth stating: one sample stretched across two octaves sounds wrong
+ * at the edges — chipmunked high, sluggish low. Keep transposition inside roughly
+ * +/- 7 semitones of the root and layer octaves rather than stretching one sample.
+ */
+export const KIT_ROOT_MIDI: Record<string, number> = {
+  guitar: 40, // E2, open low E — the fifths are rooted there
+  guitar_chord: 52, // E3, the root of the Em9 voicing
+  synth_bass: 36, // C2
+  bell: 72, // C5, approximate
+  chime: 72, // C5, approximate
+  // `choir` is deliberately absent: ambi_choir is a sustained pad with no single
+  // stated root, so it is a texture to be pitched by ear, not by arithmetic.
 };
 
 function urlFor(sourceName: string): string | null {

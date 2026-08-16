@@ -47,8 +47,22 @@ Rejected sources, for the reason that actually matters here:
 ## Naming
 
 `bd_808` ships in our kit as **`kick_deep`**. The audio is CC0 and fine to use;
-the *name* is not ours. Roland holds registered trademarks on TR-808 / TR-909 /
-TB-303. Never put "808" on a button, a filename, or a store listing.
+the *name* is a separate question. Roland holds registered trademarks on
+**TR-808 / TR-909 / TB-303**.
+
+Being accurate about the risk: those hyphenated marks are unambiguously Roland's.
+Bare "808" is used generically throughout music — as a genre shorthand, in album
+titles, as the common word for a long sub-bass kick — so it is a grey area rather
+than a clear infringement. The reason we still avoid it is asymmetry, not fear:
+the label costs nothing to change and the question costs something to answer, and
+this app may be sold.
+
+**So: never "808", "909" or "303" on a button, a filename, a pack label, or a
+store listing.** The drum pack with that character is called **Boom**.
+
+Pack labels currently in use, all safe: **Boom**, **Trap**, **Hip-Hop**, **Rock**.
+Genre names are descriptive and not anyone's mark. Melody voices: **Guitar**,
+**Vocal**, **Synth**, **Xylo** — likewise descriptive.
 
 ## Why brevity is not a defence
 
