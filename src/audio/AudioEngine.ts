@@ -2,6 +2,7 @@ import { Deck } from './Deck';
 import { BeatMachine } from './BeatMachine';
 import { Fx } from './Fx';
 import { Macros } from './macros';
+import { ensureKit } from './sampleKit';
 import { Transport } from './Transport';
 import { DEFAULT_ASSIST, type AssistSettings } from './types';
 import { encodeWav, floatToInt16 } from './wav';
@@ -205,6 +206,11 @@ export class AudioEngine {
     // The processor never writes its outputs, so this connection is silent; it
     // exists because a node must be pulled by the graph for process() to run.
     this.recorderNode.connect(this.ctx.destination);
+
+    // Fire and forget: a 35-file fetch+decode must not sit between the Start
+    // tap and the first sound. Synthesis covers the first second or two, then
+    // the voices switch over silently as buffers land.
+    void ensureKit(this.ctx);
 
     this.transport = new Transport(this.ctx);
     // Keep the drum grid locked to whatever the room is listening to, instead

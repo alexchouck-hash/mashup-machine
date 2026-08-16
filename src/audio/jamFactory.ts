@@ -1,4 +1,5 @@
 import { clap, hat, kick, openHat, snare } from './drums';
+import { ensureKit } from './sampleKit';
 import { bassNote, hzFor, pluck, progressionFor, stab, triadSemitones } from './melody';
 import type { KeyMode } from './types';
 
@@ -181,6 +182,11 @@ async function renderJamUncached(
   const frames = Math.ceil((bodySec + 0.35) * sampleRate);
 
   const off = new OfflineAudioContext(2, frames, sampleRate);
+
+  // AWAITED here, unlike the live engine's fire-and-forget. Jam renders are
+  // memoised for the session, so a jam rendered before the kit lands would keep
+  // its synthesized drums for as long as the app stays open.
+  await ensureKit(off);
 
   const master = off.createGain();
   master.gain.value = 0.9;

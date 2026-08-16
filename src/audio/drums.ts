@@ -45,6 +45,8 @@ const NOISE_SECONDS = 2;
 /** Long enough that consecutive hats never read the same window at ±1.5% rate. */
 const METAL_SECONDS = 1.2;
 
+import { kitBuffer } from './sampleKit';
+
 const clamp = (v: number, lo: number, hi: number): number => (v < lo ? lo : v > hi ? hi : v);
 
 /** Every caller-supplied number passes through here; NaN becomes the fallback. */
@@ -400,6 +402,60 @@ function mulberry32(seed: number): () => number {
   };
 }
 
+/* ------------------------------------------------------------ sampled layer */
+
+/**
+ * Play a kit sample, or report that there is none and let the caller synthesize.
+ *
+ * Returns false on a cache miss so every voice keeps exactly one shape:
+ *   if (playSample(...)) return;   // real recording
+ *   ...existing synthesis...       // fallback, unchanged
+ *
+ * `maxSec` is not optional decoration. Synth tails ended when their envelope
+ * did; a sampled ride or crash runs well over a second, and Trap fires ten hats
+ * a bar — without a bound they smear into mush at 16th notes.
+ */
+function playSample(
+  ctx: BaseAudioContext,
+  dest: AudioNode,
+  time: number,
+  name: string,
+  gain: number,
+  accent: number,
+  maxSec: number
+): boolean {
+  const buf = kitBuffer(ctx, name);
+  if (!buf) return false;
+
+  const t = at(ctx, time);
+  const v = vel(accent);
+  const src = ctx.createBufferSource();
+  src.buffer = buf;
+
+  const g = ctx.createGain();
+  const peak = amp(gain * velAmp(v), 1);
+  g.gain.setValueAtTime(peak, t);
+
+  const dur = Math.min(maxSec * velTime(v), buf.duration);
+  // Ride the tail down rather than cutting it: a hard stop on a decaying cymbal
+  // is a click, and at 16ths that click lands on every hit.
+  g.gain.setValueAtTime(peak, t + dur * 0.72);
+  g.gain.exponentialRampToValueAtTime(FLOOR, t + dur);
+
+  // A quiet hit is duller as well as softer — the same rule the synth voices
+  // follow through velTone, applied here with one filter instead of an envelope.
+  if (v < 0.99) {
+    const lp = biquad(ctx, 'lowpass', hzOf(ctx, 1200 + 14000 * velTone(v), 16000), 0.7);
+    src.connect(lp).connect(g).connect(dest);
+  } else {
+    src.connect(g).connect(dest);
+  }
+
+  src.start(t);
+  src.stop(t + dur + 0.02);
+  return true;
+}
+
 /* ------------------------------------------------------------------- voices */
 
 /**
@@ -454,6 +510,7 @@ export function kick(
   gain = 1,
   accent = 1
 ): void {
+  if (playSample(ctx, dest, time, 'kick', gain, accent, 0.9)) return;
   const t = at(ctx, time);
   const v = vel(accent);
   const A = velAmp(v);
@@ -521,6 +578,7 @@ export function snare(
   gain = 1,
   accent = 1
 ): void {
+  if (playSample(ctx, dest, time, 'snare', gain, accent, 0.7)) return;
   const t = at(ctx, time);
   const v = vel(accent);
   const A = velAmp(v);
@@ -586,6 +644,10 @@ export function clap(
   gain = 1,
   accent = 1
 ): void {
+  // Sonic Pi's CC0 set has no clap, so this one stays synthesized unless a snap
+  // is present. Adding a clap would mean a SECOND source with its own chain of
+  // title to verify — not worth it when the multi-burst synth clap is decent.
+  if (playSample(ctx, dest, time, 'snap', gain, accent, 0.5)) return;
   const t = at(ctx, time);
   const v = vel(accent);
   const A = velAmp(v);
@@ -691,6 +753,8 @@ export function hat(
   gain = 1,
   accent = 1
 ): void {
+  // Short bound: Trap fires ten of these a bar and a real cymbal rings.
+  if (playSample(ctx, dest, time, 'hat', gain, accent, 0.28)) return;
   metalHat(ctx, dest, time, gain, accent, {
     bpHz: 8600,
     bpQ: 0.8,
@@ -712,6 +776,7 @@ export function openHat(
   gain = 1,
   accent = 1
 ): void {
+  if (playSample(ctx, dest, time, 'hat_open', gain, accent, 0.7)) return;
   metalHat(ctx, dest, time, gain, accent, {
     bpHz: 8000,
     bpQ: 0.7,

@@ -77,7 +77,7 @@ export class BeatMachine {
    * ducks the decks — the child's own song pumping on every downbeat. See the
    * LEVELS block in drums.ts for the measurements.
    */
-  volume = 0.66;
+  volume = 0.52;
 
   private engine: AudioEngine;
   private bus: GainNode;
