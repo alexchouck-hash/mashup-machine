@@ -1,6 +1,7 @@
 import { Deck } from './Deck';
 import { BeatMachine } from './BeatMachine';
 import { Fx } from './Fx';
+import { Macros } from './macros';
 import { Transport } from './Transport';
 import { DEFAULT_ASSIST, type AssistSettings } from './types';
 import { encodeWav, floatToInt16 } from './wav';
@@ -18,13 +19,28 @@ const BASS_SWAP_MAX_DB = 15;
 /**
  * The mixer. One master bus; every sound source is an input to it.
  *
- *   decks ──> xfA/xfB ─┐
- *   beat machine ──────┼─> sum ─> fxFilter ─> fxGate ─> master ─> limiter ─> analyser ─> out
- *                      │              └─> delaySend ─> delay ─┘        └─> recorder
- *   one-shots ─────────────────────────────────────────> master
+ *   decks ─> xfA/xfB ─> deckDuck ─> deckBus ────┐
+ *   beat machine ─> drumLow ─> drumDrive ─> drumTrim ─┤
+ *                                                     └─> sum ─> fxFilter ─> fxGate
+ *        ─> macroGain ─> master ─> limiter ─> analyser ─> out
+ *                            fxGate ─> delaySend ─> delay ─> macroGain   └─> recorder
+ *   one-shots ─────────────────────────────────────────────> master
  *
- * One-shots (air horn, drop impact) join AFTER the gate on purpose: a drop cuts
- * the gate to silence, and the impact that sells the drop has to survive it.
+ * One-shots (air horn, riser, drop impact) join AFTER every gate on purpose: a
+ * drop cuts the signal to silence, and the sounds that SELL the drop have to
+ * survive it.
+ *
+ * The deck and drum paths are separate before the sum so a macro can duck the
+ * songs while the beat carries on (auto-bridge) or thicken the drums alone
+ * (bump boost). Echo still taps pre-macroGain, so the delay keeps being fed
+ * through a drop's silence and returns time-coherent material on the slam.
+ *
+ * PARAM OWNERSHIP — a second writer on any of these is a stranded gain or a
+ * click, which is why Macros does not simply reuse fxGate:
+ *   fxGate.gain / fxFilter.frequency        -> Fx only
+ *   macroGain.gain / deckBus.gain           -> Macros only
+ *   deckDuck.gain / drum{Low,Drive,Trim}    -> Macros only
+ *   deck.output.gain                        -> Deck.applyGain only
  */
 export class AudioEngine {
   ctx!: AudioContext;
@@ -44,15 +60,26 @@ export class AudioEngine {
   delay!: DelayNode;
   oneShotBus!: GainNode;
 
+  /** Macro stages. Written by Macros only — see PARAM OWNERSHIP above. */
+  deckDuck!: GainNode; // kick sidechain (bump boost)
+  deckBus!: GainNode; // duck the songs while drums carry (bridge / auto-mix)
+  macroGain!: GainNode; // drop gate + loudness lift
+  drumLow!: BiquadFilterNode;
+  drumDrive!: WaveShaperNode;
+  drumTrim!: GainNode;
+
   transport!: Transport;
   beatMachine!: BeatMachine;
   fx!: Fx;
+  macros!: Macros;
 
   decks: Deck[] = [];
   assist: AssistSettings = { ...DEFAULT_ASSIST };
 
   crossfade = 0.5;
   masterVolume = 1;
+  /** Sync: beats locked and both platters scratch together. */
+  linkDecks = false;
 
   recording = false;
   recordStartedAt = 0;
@@ -111,6 +138,23 @@ export class AudioEngine {
 
     this.oneShotBus = this.ctx.createGain();
 
+    this.deckDuck = this.ctx.createGain();
+    this.deckDuck.gain.value = 1;
+    this.deckBus = this.ctx.createGain();
+    this.deckBus.gain.value = 1;
+    this.macroGain = this.ctx.createGain();
+    this.macroGain.gain.value = 1;
+
+    this.drumLow = this.ctx.createBiquadFilter();
+    this.drumLow.type = 'lowshelf';
+    this.drumLow.frequency.value = 90;
+    this.drumLow.gain.value = 0;
+    // curve stays null (bypass) until Macros installs one for bump boost.
+    this.drumDrive = this.ctx.createWaveShaper();
+    this.drumDrive.oversample = '2x';
+    this.drumTrim = this.ctx.createGain();
+    this.drumTrim.gain.value = 1;
+
     this.masterGain.gain.value = MASTER_HEADROOM;
 
     // Soft limiter so a hand slamming faders cannot clip the recording.
@@ -123,19 +167,22 @@ export class AudioEngine {
     this.analyser.fftSize = 2048;
     this.meterBuf = new Float32Array(this.analyser.fftSize);
 
-    this.xfA.connect(this.sumBus);
-    this.xfB.connect(this.sumBus);
+    this.xfA.connect(this.deckDuck);
+    this.xfB.connect(this.deckDuck);
+    this.deckDuck.connect(this.deckBus);
+    this.deckBus.connect(this.sumBus);
 
     this.sumBus.connect(this.fxFilter);
     this.fxFilter.connect(this.fxGate);
-    this.fxGate.connect(this.masterGain);
+    this.fxGate.connect(this.macroGain);
+    this.macroGain.connect(this.masterGain);
 
     this.fxGate.connect(this.delaySend);
     this.delaySend.connect(this.delay);
     this.delay.connect(delayDamp);
     delayDamp.connect(delayFeedback);
     delayFeedback.connect(this.delay);
-    this.delay.connect(this.masterGain);
+    this.delay.connect(this.macroGain);
 
     this.oneShotBus.connect(this.masterGain);
 
@@ -162,7 +209,11 @@ export class AudioEngine {
     this.transport = new Transport(this.ctx);
     this.fx = new Fx(this);
     this.beatMachine = new BeatMachine(this);
-    this.addSource(this.beatMachine.output, null);
+    // Drums take their own path to the sum so bump boost can thicken them and
+    // the bridge can duck the songs without touching the beat.
+    this.beatMachine.output.connect(this.drumLow);
+    this.drumLow.connect(this.drumDrive).connect(this.drumTrim).connect(this.sumBus);
+    this.macros = new Macros(this);
 
     this.setCrossfade(this.crossfade);
     this.ready = true;
@@ -232,6 +283,59 @@ export class AudioEngine {
     if (!this.ready || !this.transport.running) return;
     const bpm = this.anchorDeck()?.effectiveBpm ?? 0;
     if (bpm > 0) this.transport.bpm = bpm;
+  }
+
+  /* ------------------------------------------------------------- deck link */
+
+  /**
+   * Sync toggle. On: the beats lock and both platters scratch as one. Off: the
+   * decks are wholly independent, which is how a DJ expects two turntables to
+   * behave.
+   */
+  setLink(on: boolean): void {
+    this.linkDecks = on;
+    if (on) this.lockToLouder();
+    this.notify();
+  }
+
+  /**
+   * Which deck leads. The owner's rule is that the QUIETER deck follows the
+   * LOUDER one, so whatever the room is actually listening to never lurches.
+   * "Louder" therefore has to mean audible level — fader, auto-gain and the
+   * crossfader together — not which letter the deck was given.
+   */
+  louderDeck(): Deck | undefined {
+    let best: Deck | undefined;
+    let bestLevel = -Infinity;
+    for (const d of this.decks) {
+      if (!d.loaded) continue;
+      const t = (this.crossfade * Math.PI) / 2;
+      const xf = d.crossfadeSide === 'A' ? Math.cos(t) : d.crossfadeSide === 'B' ? Math.sin(t) : 1;
+      // A stopped deck can never lead, however loud its fader is.
+      const level = d.volume * Math.pow(10, d.autoGainApplied / 20) * xf * (d.playing ? 1 : 0);
+      if (level > bestLevel) {
+        bestLevel = level;
+        best = d;
+      }
+    }
+    return best;
+  }
+
+  /** Pull every other deck onto the leader's tempo and downbeat. */
+  lockToLouder(): void {
+    const leader = this.louderDeck();
+    if (!leader?.analysis) return;
+    for (const d of this.decks) {
+      if (d === leader || !d.analysis) continue;
+      d.matchTempo(leader);
+      d.alignPhaseTo(leader);
+    }
+    this.syncBeatTempo();
+  }
+
+  /** Decks a gesture on `deck` should drive: both when linked, else just it. */
+  scratchGroup(deck: Deck): Deck[] {
+    return this.linkDecks ? this.decks.filter((d) => d.loaded) : [deck];
   }
 
   /* -------------------------------------------------------------- crossfade */

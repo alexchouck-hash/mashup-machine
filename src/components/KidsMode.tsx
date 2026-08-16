@@ -5,6 +5,7 @@ import { GROOVES, type DrumLayer } from '../audio/BeatMachine';
 import { JAMS, prewarmJams, renderJam, type JamSpec } from '../audio/jamFactory';
 import { downloadBlob, recordingFilename } from '../audio/wav';
 import { useEngineVersion } from '../hooks/useEngine';
+import { Turntable } from './Turntable';
 
 /**
  * Party Mode — the surface a child actually uses.
@@ -241,16 +242,38 @@ function SongTile({ deck, color }: { deck: Deck; color: string }) {
         </div>
       ) : (
         <>
+          {/* The platter is the play surface. Turntable swallows the click that
+              ends a grab, so a scratch never also toggles playback. */}
           <button
             onClick={() => deck.togglePlay()}
-            className="flex-1 w-full flex flex-col items-center justify-center gap-1 py-4 sm:py-6 px-3 transition"
+            className="flex-1 w-full flex flex-col items-center justify-center gap-1 py-2 sm:py-3 px-3 transition"
           >
-            <span className="text-5xl sm:text-6xl leading-none">{deck.playing ? '⏸' : '▶'}</span>
+            <Turntable
+              deck={deck}
+              color={color}
+              onScratchStart={(e) => {
+                for (const d of engine.scratchGroup(e.deck)) d.scratchStart();
+              }}
+              onScratchMove={(e) => {
+                for (const d of engine.scratchGroup(e.deck)) {
+                  // The grabbed deck follows the finger's absolute position; a
+                  // linked partner follows only its SPEED, since its own
+                  // playhead is somewhere else entirely in a different track.
+                  if (d === e.deck) d.scratchMove(e.positionSec, e.rate);
+                  else d.scratchRate(e.rate);
+                }
+              }}
+              onScratchEnd={(e) => {
+                for (const d of engine.scratchGroup(e.deck)) {
+                  d.scratchEnd(d === e.deck ? e.wasPlaying : undefined);
+                }
+              }}
+            />
             <span
-              className="font-black uppercase tracking-wide text-xs sm:text-sm"
+              className="font-black uppercase tracking-wide text-[11px] sm:text-xs"
               style={{ color: deck.playing ? color : '#94a3b8' }}
             >
-              {deck.playing ? 'Playing' : 'Tap to play'}
+              {deck.playing ? 'Playing — spin me' : 'Tap to play'}
             </span>
           </button>
           <div className="px-2 pb-1.5 grid grid-cols-4 gap-1">
@@ -327,6 +350,7 @@ export function KidsMode({ onExit }: { onExit: () => void }) {
   useEngineVersion();
   const bm = engine.beatMachine;
   const fx = engine.fx;
+  const macros = engine.macros;
   const [a, b] = engine.decks;
   const stepRef = useRef<HTMLDivElement>(null);
 
@@ -489,7 +513,54 @@ export function KidsMode({ onExit }: { onExit: () => void }) {
           />
           <BigPad emoji="📣" label="Horn" color="#fb923c" onPress={() => fx.horn()} />
           <BigPad emoji="🚀" label="Build" color="#f472b6" onPress={() => fx.build()} />
-          <BigPad emoji="💣" label="Drop" color="#ef4444" onPress={() => fx.drop()} />
+          <BigPad emoji="💥" label="Big drop" color="#ef4444" onPress={() => macros.bigDrop()} />
+        </div>
+      </div>
+
+      {/* auto-mix and the link toggle */}
+      <div className="panel p-2.5 sm:p-3 space-y-2">
+        <div className="flex items-baseline justify-between">
+          <span className="lbl">Do it for me</span>
+          {macros.lastNote && (
+            <span className="text-[10px] text-slate-400 truncate ml-2">{macros.lastNote}</span>
+          )}
+        </div>
+        <div className="grid grid-cols-3 sm:grid-cols-5 gap-1.5 sm:gap-2">
+          <BigPad
+            emoji="🎤"
+            label="1 over 2"
+            color="#22d3ee"
+            active={macros.mixActive === 'AB'}
+            onPress={() => macros.autoMixAOverB()}
+          />
+          <BigPad
+            emoji="🎤"
+            label="2 over 1"
+            color="#f472b6"
+            active={macros.mixActive === 'BA'}
+            onPress={() => macros.autoMixBOverA()}
+          />
+          <BigPad
+            emoji="🥁"
+            label="Bridge"
+            color="#a3e635"
+            disabled={macros.busy}
+            onPress={() => macros.bridge()}
+          />
+          <BigPad
+            emoji="🔊"
+            label="Bump"
+            color="#facc15"
+            active={macros.bumpOn}
+            onPress={() => macros.toggleBump()}
+          />
+          <BigPad
+            emoji="🔗"
+            label="Sync"
+            color="#c084fc"
+            active={engine.linkDecks}
+            onPress={() => engine.setLink(!engine.linkDecks)}
+          />
         </div>
       </div>
     </div>

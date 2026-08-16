@@ -70,7 +70,14 @@ export class BeatMachine {
     melody: false,
   };
   grooveIndex = 0;
-  volume = 0.85;
+  /**
+   * 0.66, not 0.85: the layered voices in drums.ts sum ~2.2 dB hotter than the
+   * ones they replaced (the kick and sub now hold level long enough to sum
+   * coherently). Without this trim the drum bus pushes the MASTER limiter, which
+   * ducks the decks — the child's own song pumping on every downbeat. See the
+   * LEVELS block in drums.ts for the measurements.
+   */
+  volume = 0.66;
 
   private engine: AudioEngine;
   private bus: GainNode;

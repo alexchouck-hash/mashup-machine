@@ -77,6 +77,8 @@ export class Deck {
   vocalMode: VocalMode = 'both';
   /** RMS of the side signal relative to mid. 0 = mono, so nothing to cancel. */
   stereoWidth = 0;
+  /** A finger is on this platter. Set at the gesture boundaries only. */
+  scratching = false;
 
   private pathBoth: GainNode;
   private pathMusic: GainNode;
@@ -545,6 +547,65 @@ export class Deck {
     const beat = 60 / this.analysis.bpm;
     const rel = this.positionSecNow - this.analysis.firstBeatSec;
     return (((rel / beat) % 1) + 1) % 1;
+  }
+
+  /* --------------------------------------------------------------- scratch */
+
+  /**
+   * Grab the platter. The worklet swaps to its scratch engine — signed-rate
+   * resampled playback, so pitch bends with the hand and reverse works.
+   *
+   * Note what does NOT happen here: no pause(). The worklet keeps `playing`
+   * meaningful across a gesture on purpose, so a paused deck can still be
+   * scratched and a bare scratchEnd() restores whatever the deck actually is.
+   */
+  scratchStart(): void {
+    if (!this.loaded) return;
+    this.scratching = true;
+    this.node.port.postMessage({
+      type: 'scratchOn',
+      frame: this.positionSecNow * this.sampleRate,
+      velocity: 0,
+    });
+    this.engine.notify();
+  }
+
+  /**
+   * Mid-gesture update. DELIBERATELY SILENT — no engine.notify().
+   *
+   * A gesture emits up to ~60 of these a second, and two children means ~120.
+   * Notifying would re-render KidsMode and both song tiles on every one, which
+   * is exactly the per-frame React work the canvas rAF loops exist to avoid.
+   * Nothing UI-visible changes mid-gesture anyway; the platter draws itself from
+   * deck.positionSecNow.
+   */
+  scratchMove(positionSec: number, rate: number): void {
+    if (!this.scratching) return;
+    this.node.port.postMessage({ type: 'scratchJog', frame: positionSec * this.sampleRate });
+    this.node.port.postMessage({ type: 'scratchRate', value: rate });
+  }
+
+  /**
+   * Rate-only update, for a deck linked to a platter someone else is holding.
+   * It follows the hand's SPEED but keeps its own playhead — jogging it to the
+   * grabbed deck's absolute position would be meaningless across two tracks.
+   */
+  scratchRate(rate: number): void {
+    if (!this.scratching) return;
+    this.node.port.postMessage({ type: 'scratchRate', value: rate });
+  }
+
+  /** Release. `play` omitted means "restore whatever the deck is now". */
+  scratchEnd(play?: boolean): void {
+    if (!this.scratching) return;
+    this.scratching = false;
+    this.node.port.postMessage({ type: 'scratchOff', play });
+    this.engine.notify();
+  }
+
+  /** How lazily the platter spins back up after a release, in seconds. */
+  setScratchInertia(seconds: number): void {
+    this.node.port.postMessage({ type: 'scratchInertia', releaseSec: seconds });
   }
 
   /** Shift by less than half a beat so our grid sits on theirs. */

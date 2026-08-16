@@ -161,6 +161,7 @@ export default function App() {
 
   const enterKids = useCallback(() => {
     engine.fx.releaseAll();
+    engine.macros.releaseAll();
     for (const k of ALL_ASSISTS) engine.setAssist(k, true);
     setMode('kids');
   }, []);
@@ -176,6 +177,7 @@ export default function App() {
       <KidsMode
         onExit={() => {
           engine.fx.releaseAll();
+          engine.macros.releaseAll();
           setMode('dj');
         }}
       />
