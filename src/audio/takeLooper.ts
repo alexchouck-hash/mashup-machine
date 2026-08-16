@@ -194,6 +194,8 @@ export class GridClock {
   private started = false;
   /** A seeded origin is provisional: the first real step re-bases and re-epochs. */
   private provisional = false;
+  /** The transport was seen stopped; the next step observed is a restart. */
+  private stopped = false;
 
   constructor(ctx: BaseAudioContext, transport: Transport) {
     this.ctx = ctx;
@@ -217,6 +219,21 @@ export class GridClock {
     this.provisional = true;
   }
 
+  /**
+   * Watch for the transport stopping. Cheap, and called from each looper's
+   * commit poll.
+   *
+   * A broken step sequence catches most restarts, but NOT the one-in-sixteen
+   * where the clock stops on step 15 and restarts on step 0 — that reads as
+   * perfectly continuous while real time has jumped. Asking the transport
+   * directly closes it, and it cannot false-positive on a scratch: a frozen
+   * platter also produces a long gap between consecutive steps, but the
+   * transport is still `running` throughout.
+   */
+  pollRunning(): void {
+    if (!this.transport.running) this.stopped = true;
+  }
+
   observe(step: number, time: number): void {
     if (this.started && step === this.lastStep && time === this.stepTime) return;
 
@@ -225,17 +242,17 @@ export class GridClock {
       this.started = true;
       this.provisional = false;
       this.absStep = step;
-    } else if (step === (this.lastStep + 1) % STEPS_PER_BAR) {
+    } else if (!this.stopped && step === (this.lastStep + 1) % STEPS_PER_BAR) {
       this.absStep++;
     } else {
-      // The step sequence broke, which only happens when the transport was
-      // stopped and started again. Re-base onto the next bar keeping the
-      // invariant absStep % 16 === step, and bump the epoch so any take open
-      // across the restart is re-derived rather than trusted.
+      // The transport was stopped and started again. Re-base onto the next bar
+      // keeping the invariant absStep % 16 === step, and bump the epoch so any
+      // take open across the restart is re-derived rather than trusted.
       this.epoch++;
       this.absStep = (Math.floor(this.absStep / STEPS_PER_BAR) + 1) * STEPS_PER_BAR + step;
     }
 
+    this.stopped = false;
     this.lastStep = step;
     this.stepTime = time;
   }
@@ -344,6 +361,15 @@ export class TakeLooper<S> {
   private timer: number | null = null;
   private onVisible: (() => void) | null = null;
 
+  /**
+   * CONSECUTIVE failures, cleared by any clean step — not a lifetime tally.
+   *
+   * As a lifetime counter, three unrelated hiccups spread across a whole party
+   * permanently silenced the surface with no way back short of a reload. The
+   * guard exists to stop a genuinely broken take from wedging Transport.tick
+   * (which has no try/catch), and three failures IN A ROW is what broken looks
+   * like; three across an hour is just a long party.
+   */
   private errs = 0;
   private dead = false;
 
@@ -388,7 +414,10 @@ export class TakeLooper<S> {
     // three read ctx.currentTime — never a wall clock, never the timer's own
     // firing time, both of which lie when the tab is throttled.
     if (typeof window !== 'undefined') {
-      this.timer = window.setInterval(() => this.maybeCommit(), COMMIT_POLL_MS);
+      this.timer = window.setInterval(() => {
+        this.clock.pollRunning();
+        this.maybeCommit();
+      }, COMMIT_POLL_MS);
     }
     if (typeof document !== 'undefined') {
       this.onVisible = () => this.maybeCommit();
@@ -447,10 +476,17 @@ export class TakeLooper<S> {
     return clamp(left / this.config.idleSec, 0, 1);
   }
 
-  /** Convenience for the rAF loop: 1 at the hit, fading to 0 over `decaySec`. */
+  /**
+   * Convenience for the rAF loop: 1 at the hit, fading to 0 over `decaySec`.
+   *
+   * A hit still in the FUTURE glows 0. That is the whole point of scheduling the
+   * light rather than lighting it in the step handler — without this guard a pad
+   * lights up to 120 ms before its own sound, which is the lookahead made
+   * visible.
+   */
   glow(key: number, now: number, decaySec = 0.18): number {
     const t = this.flash.get(key);
-    if (t === undefined) return 0;
+    if (t === undefined || now < t) return 0;
     return clamp(1 - (now - t) / decaySec, 0, 1);
   }
 
@@ -487,18 +523,14 @@ export class TakeLooper<S> {
       this.safely(() => this.hooks.ensureClock());
     }
 
-    const at = now + LIVE_LEAD_SEC;
+    const soundAt = now + LIVE_LEAD_SEC;
+    const v = clamp(vel, 0, 1);
     this.lastVoiceAt.set(key, now);
-    this.flash.set(key, at);
-    this.safely(() => this.config.voice.play(this.ctx, this.dest, at, p, 1, clamp(vel, 0, 1)));
+    this.flash.set(key, soundAt);
+    this.safely(() => this.config.voice.play(this.ctx, this.dest, soundAt, p, 1, v));
 
-    this.taps.push({
-      at,
-      grid: this.clock.gridAt(at),
-      epoch: this.clock.epoch,
-      vel: clamp(vel, 0, 1),
-      p,
-    });
+    // `at` is when the FINGER landed, not when the voice was scheduled.
+    this.taps.push({ at: now, grid: this.clock.gridAt(now), epoch: this.clock.epoch, vel: v, p });
     this.lastTapAt = now;
 
     // Deliberately no changed() here. A take opening is a per-tap event and the
@@ -522,18 +554,23 @@ export class TakeLooper<S> {
   commitNow(): boolean {
     if (this.taps.length === 0) return false;
 
-    const taps = this.taps;
-    this.taps = [];
-    this.lastTapAt = -1;
-
     if (this.stack.length >= this.config.maxTakes) {
       // Refuse rather than silently evict the oldest loop. A child who has built
       // six layers did not ask for one of them to disappear.
+      //
+      // Checked BEFORE draining, and the ordering is the whole point: draining
+      // first threw away the phrase they had just spent eight seconds playing,
+      // so a full stack ate the take AND kept the loop. Now the take survives —
+      // clear a loop and the pending phrase commits on the next idle window.
       this.noticeText = 'FULL';
       this.noticeUntil = this.ctx.currentTime + NOTICE_SEC;
       this.safely(() => this.hooks.changed());
       return false;
     }
+
+    const taps = this.taps;
+    this.taps = [];
+    this.lastTapAt = -1;
 
     let take: Take<S>;
     try {
@@ -605,6 +642,8 @@ export class TakeLooper<S> {
         this.flash.set(this.slotKey[i], at);
         voice.play(this.ctx, this.dest, at, this.slotP[i], this.slotGain[i], this.slotVel[i]);
       }
+      // A step that scheduled cleanly proves the surface is not wedged.
+      this.errs = 0;
     } catch {
       this.errs++;
       if (this.errs >= MAX_STEP_ERRORS) this.dead = true;

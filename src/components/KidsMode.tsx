@@ -2,9 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { CSSProperties, ReactNode } from 'react';
 import { engine } from '../audio/AudioEngine';
 import type { Deck } from '../audio/Deck';
-import { DRUM_PACKS, type DrumPack } from '../audio/drumPacks';
-import { scaleOf } from '../audio/melody';
-import { anchorKey } from '../audio/melodyLooper';
+import { OCTAVE_LABELS } from '../audio/melodyLooper';
 import { JAMS, prewarmJams, renderJam, type JamSpec } from '../audio/jamFactory';
 import { downloadBlob, recordingFilename } from '../audio/wav';
 import { useEngineVersion } from '../hooks/useEngine';
@@ -462,6 +460,10 @@ interface LooperView {
   readonly openTaps: readonly TapView[];
   /** keyOf(payload) -> ctx time the hit is scheduled to SOUND. */
   readonly flash: ReadonlyMap<number, number>;
+  /** A take is being played right now and has not committed yet. */
+  readonly isOpen: boolean;
+  /** A refusal the child should see ("no room for a seventh"), or ''. Expires itself. */
+  readonly notice: string;
   loopSteps(): number;
   phase01(): number;
   openRemaining01(): number;
@@ -473,33 +475,21 @@ interface LooperView {
 const FLASH_SEC = 0.18;
 /** The commit animation: raw marks slide onto the grid. */
 const SLIDE_SEC = 0.2;
-/** Mirrors TakeConfig.maxTakes. Used for one hint string, nothing else. */
-const MAX_TAKES = 6;
+/** Marks drawn on one position strip per frame, at most. */
+const MAX_MARKS = 400;
 
 const REC_COLOR = '#ef4444';
 const DRUM_ACCENT = '#a3e635';
 const KEY_ACCENT = '#c084fc';
 
 /**
- * Six pads, roles fixed across all three packs — pad 1 is always the boom
- * whatever kit is selected, so the labels never move under a child's finger.
- * The pad's payload is its slot index; the pack decides how a slot SOUNDS.
+ * One emoji per pad ROLE. The roles themselves — and their order, and their
+ * words — are the engine's (`bm.padLabels`), because the slot index is the
+ * looper's payload; this table only says which picture goes on which slot. Pad
+ * 1 is always the boom whatever pack is selected, so nothing moves under a
+ * child's finger when the kit changes.
  */
-const PADS = [
-  { emoji: '💥', label: 'Boom' },
-  { emoji: '👏', label: 'Clap' },
-  { emoji: '✨', label: 'Tss' },
-  { emoji: '🌟', label: 'Open' },
-  { emoji: '🥁', label: 'Tom' },
-  { emoji: '🔔', label: 'Ting' },
-];
-
-/** Low / Mid / High rather than 3 / 4 / 5 — Party Mode shows no numerals. */
-const OCTAVES = [
-  { octave: 3, label: 'Low' },
-  { octave: 4, label: 'Mid' },
-  { octave: 5, label: 'High' },
-];
+const PAD_EMOJI = ['💥', '👏', '✨', '🌟', '🥁', '🔔'];
 
 /** The commit animation's held state: where each raw tap was, and where it goes. */
 interface Slide {
@@ -520,6 +510,7 @@ interface Frame {
   takes: number;
   rec: boolean | null;
   hint: string | null;
+  errs: number;
 }
 
 const newFrame = (): Frame => ({
@@ -529,7 +520,11 @@ const newFrame = (): Frame => ({
   takes: -1,
   rec: null,
   hint: null,
+  errs: 0,
 });
+
+/** Paints before this surface gives up, so a broken frame cannot spam at 60Hz. */
+const MAX_PAINT_ERRORS = 5;
 
 /**
  * Glow for one key. `t` is the time the hit is scheduled to SOUND, and the
@@ -643,17 +638,21 @@ function drawStrip(cv: HTMLCanvasElement, l: LooperView, f: Frame, now: number):
   const sliding = f.slide !== null && now < f.slide.until;
 
   // Committed takes. A 1-bar take against a 4-bar strip is drawn four times,
-  // because that is where its pads will actually light.
+  // because that is where its pads will actually light. MAX_MARKS is a CPU
+  // bound, not a correctness one: six 8-bar takes of dense sixteenths is more
+  // marks than a 300px strip can resolve anyway.
   let drawn = 0;
   for (const take of l.takes) {
+    if (drawn >= MAX_MARKS) break;
     if (sliding && f.slide && take.id === f.slide.id) continue;
     const steps = Math.max(1, take.steps);
     const reps = Math.max(1, Math.round(L / steps));
     for (const bucket of take.byStep) {
+      if (drawn >= MAX_MARKS) break;
       if (!bucket) continue;
       for (const hit of bucket) {
         for (let r = 0; r < reps; r++) {
-          if (drawn++ > 400) break;
+          if (drawn++ >= MAX_MARKS) break;
           mark((hit.step + hit.frac + r * steps) / L, hit.vel, take.color, 0.95);
         }
       }
@@ -698,7 +697,7 @@ function paintSurface(
   octaveGhost: boolean
 ): void {
   const now = engine.ctx.currentTime;
-  const open = l.openTaps.length > 0;
+  const open = l.isOpen;
 
   // A take opening is NOT a notify-worthy event (it happens on a tap), so the
   // recording border and its countdown are driven from here. Both writes are
@@ -709,19 +708,23 @@ function paintSurface(
   }
   if (fill) fill.style.transform = `scaleX(${(open ? sat(l.openRemaining01()) : 0).toFixed(3)})`;
 
+  // The one line of words on this surface, and the whole OPEN-vs-LOOPING
+  // distinction in text for a child who can read a little. `notice` is the
+  // looper's own refusal (a seventh take), and it expires on its own clock —
+  // which is why this is polled here rather than pushed through React.
   if (hintEl) {
-    const takes = l.takes.length;
-    const hint = open
-      ? 'Listening…'
-      : takes === 0
-        ? 'Tap, then wait'
-        : takes >= MAX_TAKES
-          ? 'Full — clear one'
+    const refusal = l.notice;
+    const hint = refusal
+      ? refusal
+      : open
+        ? 'Listening…'
+        : l.takes.length === 0
+          ? 'Tap, then wait'
           : 'Looping';
     if (hint !== f.hint) {
       f.hint = hint;
       hintEl.textContent = hint;
-      hintEl.dataset.rec = open ? 'true' : 'false';
+      hintEl.dataset.rec = open || refusal ? 'true' : 'false';
     }
   }
 
@@ -802,18 +805,28 @@ function LoopSurface({
   useEffect(() => {
     let raf = 0;
     const loop = () => {
-      // Re-arm FIRST. A throw inside the paint then costs one frame instead of
-      // stopping the surface for the rest of the party.
+      // Re-arm FIRST, so a throw inside the paint costs one frame rather than
+      // stopping the surface for the rest of the party. Then bound the damage
+      // the other way: five bad frames and this surface stops repainting, which
+      // is a still picture instead of sixty console errors a second hiding
+      // whatever went wrong underneath.
       raf = requestAnimationFrame(loop);
-      paintSurface(
-        looper,
-        frame.current,
-        wellRef.current,
-        fillRef.current,
-        hintRef.current,
-        canvasRef.current,
-        octaveGhost
-      );
+      const f = frame.current;
+      try {
+        paintSurface(
+          looper,
+          f,
+          wellRef.current,
+          fillRef.current,
+          hintRef.current,
+          canvasRef.current,
+          octaveGhost
+        );
+      } catch (err) {
+        f.errs++;
+        if (f.errs === 1) console.error('[loop surface] paint failed', err);
+        if (f.errs >= MAX_PAINT_ERRORS) cancelAnimationFrame(raf);
+      }
     };
     raf = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(raf);
@@ -866,40 +879,54 @@ function LoopSurface({
       </div>
 
       <div className="take-bar">
-        <span className="take-hint" ref={hintRef} />
-        <span className="take-chips">
-          {takes.map((t, i) => (
-            <span
-              key={t.id}
-              className="take-chip"
-              data-newest={i === takes.length - 1 ? 'true' : 'false'}
-              style={{ '--c': t.color } as CSSProperties}
-              aria-hidden="true"
-            />
-          ))}
+        {/* The rAF loop owns this text from the first frame on. The literal is
+            what it says before that frame lands — React never writes it again,
+            because the JSX child never changes, so the two do not fight. */}
+        <span className="take-hint" ref={hintRef}>
+          Tap, then wait
         </span>
         {/* Never disabled: whether a take is open changes on a tap, which does
             not re-render React, so a disabled state here would go stale exactly
-            when a child reaches for undo. Both are harmless no-ops when empty. */}
-        <button
-          className="key key--text"
-          onClick={() => {
-            looper.clearLast();
-            disarm();
-          }}
-          title="Remove the last loop"
-        >
-          Clear last
-        </button>
-        <button
-          className="key key--text key--danger"
-          data-armed={armed ? 'true' : 'false'}
-          onClick={onReset}
-          onBlur={disarm}
-          title={resetLabel}
-        >
-          {armed ? 'Sure?' : resetLabel}
-        </button>
+            when a child reaches for undo. Both are harmless no-ops when empty.
+            They travel together so a narrow phone wraps the PAIR to its own
+            line rather than splitting them. */}
+        <span className="take-acts">
+          <button
+            className="key key--text"
+            onClick={() => {
+              looper.clearLast();
+              disarm();
+            }}
+            title="Remove the last loop"
+          >
+            Clear last
+          </button>
+          <button
+            className="key key--text key--danger"
+            data-armed={armed ? 'true' : 'false'}
+            onClick={onReset}
+            onBlur={disarm}
+            title={armed ? 'Tap again to clear every loop' : resetLabel}
+          >
+            {armed ? 'Sure?' : resetLabel}
+          </button>
+        </span>
+        {/* One chip per committed loop, on its own full-width line below the
+            readout — so a sixth loop can never squeeze the words or the undo
+            buttons, and a surface with nothing recorded costs no row at all.
+            Decoration: the strip above says the same thing with more detail. */}
+        {takes.length > 0 && (
+          <span className="take-chips" aria-hidden="true">
+            {takes.map((t, i) => (
+              <span
+                key={t.id}
+                className="take-chip"
+                data-newest={i === takes.length - 1 ? 'true' : 'false'}
+                style={{ '--c': t.color } as CSSProperties}
+              />
+            ))}
+          </span>
+        )}
       </div>
     </div>
   );
@@ -928,16 +955,19 @@ function BeatsRow() {
       legend={
         <>
           <span className="legend">Beats</span>
-          <div className="seg" role="group" aria-label="Drum pack">
-            {DRUM_PACKS.map((p: DrumPack, i: number) => (
+          {/* A pack is a kit swap, so it re-voices the loops a child has already
+              built — which is why it belongs on the legend beside the pads and
+              not buried somewhere they cannot see what changed. */}
+          <div className="seg seg--tight" role="group" aria-label="Drum pack">
+            {bm.packs.map((p, i) => (
               <button
                 key={p.name}
                 onClick={() => bm.setPack(i)}
                 data-on={bm.packIndex === i ? 'true' : 'false'}
                 aria-pressed={bm.packIndex === i}
-                className="seg-btn seg-btn--wide"
+                className="seg-btn seg-btn--tight"
               >
-                {p.name}
+                <span className="seg-txt">{p.name}</span>
               </button>
             ))}
           </div>
@@ -960,13 +990,13 @@ function BeatsRow() {
     >
       <div className="rack-scroll">
         <div className="beatpad">
-          {PADS.map((p, slot) => (
+          {bm.padLabels.map((label, slot) => (
             <button
-              key={p.label}
+              key={label}
               className="pad"
               data-lit-key={slot}
               style={padStyle}
-              aria-label={p.label}
+              aria-label={label}
               onPointerDown={() => bm.drums.tap(slot, 1)}
               onKeyDown={(e) => {
                 if (e.repeat || (e.key !== 'Enter' && e.key !== ' ')) return;
@@ -977,8 +1007,8 @@ function BeatsRow() {
               <span className="pad-led">
                 <span className="pad-led-on" />
               </span>
-              <span className="pad-emoji">{p.emoji}</span>
-              <span className="pad-label">{p.label}</span>
+              <span className="pad-emoji">{PAD_EMOJI[slot] ?? '🥁'}</span>
+              <span className="pad-label">{label}</span>
             </button>
           ))}
         </div>
@@ -991,28 +1021,17 @@ function BeatsRow() {
 
 function KeysRow() {
   const bm = engine.beatMachine;
-  const [octave, setOctave] = useState(4);
   const dragging = useRef(false);
   const lastMidi = useRef(-1);
 
-  // What is actually being HEARD, not the raw analysis: anchorKey() folds in
-  // the anchor deck's harmonic nudge, and falls back to A minor so the layout
-  // is identical — never disabled, never empty — in a room with no song yet.
-  const { pc, mode } = anchorKey(engine);
-  const scale = scaleOf(mode);
-
-  // The five chromatic in-betweens, each parked on the boundary between the
-  // two scale degrees it sits between. `i` counts the degrees below it, which
-  // is exactly the gap index the CSS positions against.
-  const blacks: Array<{ off: number; i: number }> = [];
-  for (let off = 1; off < 12; off++) {
-    if (scale.indexOf(off) >= 0) continue;
-    let i = 0;
-    for (const s of scale) if (s < off) i++;
-    blacks.push({ off, i });
-  }
-
-  const midiOf = (off: number) => 12 * (octave + 1) + pc + off;
+  // The layout is the engine's, not ours: whiteCaps() are the seven scale
+  // degrees of the key the room is actually HEARING (anchor deck plus its
+  // harmonic nudge, falling back to A minor so nothing ever looks disabled),
+  // and blackCaps() are the five chromatic in-betweens with the boundary each
+  // one parks on. Recomputing any of that here would be a second copy of the
+  // key theory that could disagree with the notes that actually sound.
+  const whites = bm.keys.whiteCaps();
+  const blacks = bm.keys.blackCaps();
 
   // One path for tap and glissando, mouse and touch. elementFromPoint rather
   // than pointerenter because a touch pointer is implicitly captured by the
@@ -1029,9 +1048,14 @@ function KeysRow() {
     bm.tapKey(midi, 1);
   };
 
+  // Minor keys put an accidental ABOVE the seventh degree — A minor, the
+  // no-song-loaded default, is one — and it has nowhere to sit unless the bed
+  // reserves room to the right of the last white key. Only the caller knows
+  // the scale, so the flag is set here and the geometry stays in CSS.
   const keyStyle = {
     '--k': KEY_ACCENT,
     '--k-glow': `${KEY_ACCENT}88`,
+    '--kb-edge': blacks.some((c) => c.afterIndex >= whites.length - 1) ? 1 : 0,
   } as CSSProperties;
 
   return (
@@ -1042,21 +1066,25 @@ function KeysRow() {
       legend={
         <>
           <span className="legend">Keys</span>
-          <div className="seg" role="group" aria-label="How high">
-            {OCTAVES.map((o) => (
+          {/* Low / Mid / High. A seven-year-old does not read "octave 4". */}
+          <div className="seg seg--tight" role="group" aria-label="How high">
+            {OCTAVE_LABELS.map((label, i) => (
               <button
-                key={o.octave}
-                onClick={() => setOctave(o.octave)}
-                data-on={octave === o.octave ? 'true' : 'false'}
-                aria-pressed={octave === o.octave}
-                className="seg-btn seg-btn--wide"
+                key={label}
+                onClick={() => bm.keys.setOctave(i)}
+                data-on={bm.keys.octaveIndex === i ? 'true' : 'false'}
+                aria-pressed={bm.keys.octaveIndex === i}
+                className="seg-btn seg-btn--tight"
               >
-                {o.label}
+                <span className="seg-txt">{label}</span>
               </button>
             ))}
           </div>
+          {/* The two assists the performer may refuse. Both default ON; with
+              both off the keyboard plays back exactly what was tapped, at the
+              pitches that were tapped, when they were tapped. */}
           <button
-            className="key key--text key--key"
+            className="key key--text key--keys"
             data-on={bm.autoTune ? 'true' : 'false'}
             aria-pressed={bm.autoTune}
             title="Auto-tune — snap what you play into the song's key"
@@ -1065,7 +1093,7 @@ function KeysRow() {
             Tune
           </button>
           <button
-            className="key key--text key--key"
+            className="key key--text key--keys"
             data-on={bm.beatMatch ? 'true' : 'false'}
             aria-pressed={bm.beatMatch}
             title="Auto beat-match — snap what you play onto the beat"
@@ -1107,19 +1135,22 @@ function KeysRow() {
             dragging.current = false;
           }}
         >
+          {/* --kb-i is the gap this accidental sits in, counted in white keys
+              from the left. afterIndex is 0-based ("right of white key n"), the
+              CSS boundary is 1-based, hence the +1. */}
           <div className="keybed-blacks">
-            {blacks.map((b) => (
+            {blacks.map((cap) => (
               <button
-                key={b.off}
+                key={cap.midi}
                 className="keybed-black"
-                data-midi={midiOf(b.off)}
-                data-lit-key={midiOf(b.off)}
-                style={{ '--kb-i': b.i } as CSSProperties}
-                aria-label="In-between note"
+                data-midi={cap.midi}
+                data-lit-key={cap.midi}
+                style={{ '--kb-i': cap.afterIndex + 1 } as CSSProperties}
+                aria-label={cap.label}
                 onKeyDown={(e) => {
                   if (e.repeat || (e.key !== 'Enter' && e.key !== ' ')) return;
                   e.preventDefault();
-                  bm.tapKey(midiOf(b.off), 1);
+                  bm.tapKey(cap.midi, 1);
                 }}
               >
                 <span className="keybed-glow" />
@@ -1127,22 +1158,24 @@ function KeysRow() {
             ))}
           </div>
           <div className="keybed-whites">
-            {scale.map((off, i) => (
+            {whites.map((cap) => (
               <button
-                key={off}
+                key={cap.midi}
                 className="keybed-key"
-                data-midi={midiOf(off)}
-                data-lit-key={midiOf(off)}
-                data-role={off === 0 ? 'root' : off === 7 ? 'fifth' : 'in'}
-                aria-label={`Note ${i + 1}`}
+                data-midi={cap.midi}
+                data-lit-key={cap.midi}
+                // Root and fifth — the two that cannot sound wrong — carry a
+                // deeper band of the key colour.
+                data-strong={cap.strong ? 'true' : 'false'}
+                aria-label={cap.label}
                 onKeyDown={(e) => {
                   if (e.repeat || (e.key !== 'Enter' && e.key !== ' ')) return;
                   e.preventDefault();
-                  bm.tapKey(midiOf(off), 1);
+                  bm.tapKey(cap.midi, 1);
                 }}
               >
                 <span className="keybed-glow" />
-                {off === 0 && <span className="keybed-home" />}
+                {cap.degree === 0 && <span className="keybed-home" />}
               </button>
             ))}
           </div>

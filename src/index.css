@@ -339,11 +339,36 @@ input[type='range']:disabled {
     outline: 2px solid #e2e8f0;
     outline-offset: 1px;
   }
-  /* Groove selector: one word per segment instead of an icon stack. */
+  /* Groove / octave selector: one word per segment instead of an icon stack. */
   .seg-btn--wide {
     padding: 6px 10px;
     font-size: 10px;
     letter-spacing: 0.1em;
+  }
+  /* A switch that has to share a legend line with a legend AND one or two keys:
+     the four drum packs, and the three octaves.
+
+     Two things make it fit. The segments are CONTENT-sized (flex 0 1 auto,
+     against .seg-btn's 1 1 0), because equal widths clip "Hip-Hop" — 60% wider
+     than "808" — down to a name a child cannot guess from three letters. And
+     the switch outgrows the silkscreen legend beside it. Measured at 320px, the
+     narrowest phone we draw for: 263px used of 278px available, nothing
+     clipped, no horizontal scroll. */
+  .seg--tight {
+    flex: 2 1 auto;
+    min-width: 0;
+  }
+  .seg-btn--tight {
+    flex: 0 1 auto;
+    padding: 6px 5px;
+    font-size: 9px;
+    letter-spacing: 0.02em;
+  }
+  .seg-txt {
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   /* Square icon key: Hook, eject. */
@@ -620,19 +645,36 @@ input[type='range']:disabled {
      the song's key with the root on the left, and the five small ones are the
      chromatic in-betweens. The in-key notes are therefore the BIG targets, so
      the highlight is structural as well as coloured and bad aim lands on a
-     note that works.
-
-     --kb-black-w is 36px, not the 40px first sketched, because the real well
-     is 304px wide and not 330: that makes a white key 40px, and a black key
-     may not be as wide as a white one. */
+     note that works. Measured on a 360px phone: white keys 37 x 76, black keys
+     32 x 46, nothing scrolling, nothing overlapping. */
   .keybed {
     --kb-gap: 4px;
-    --kb-black-w: 36px;
+    /* 32, not the 40 first sketched: the real well is 304px wide, not 330, so a
+       white key is ~37px on a phone and a 40px accidental would be WIDER than
+       the note it sits between. 32 keeps the piano proportion legible and the
+       out-of-key notes visibly the smaller targets. */
+    --kb-black-w: 32px;
+    /* 1 when the key has an accidental ABOVE its seventh degree — every minor
+       key does, A minor included, and that is the default with no song loaded.
+       Set by KidsMode, because only the caller knows the current scale. */
+    --kb-edge: 0;
+    /* Room at the right for that one key. Without it the last accidental gets
+       clamped back inside and OVERLAPS its neighbour by 8px: measured, not
+       theoretical. The whites give up the width, so the reserve is added to the
+       bed's minimum rather than taken out of a 38px key. */
+    --kb-reserve: calc((var(--kb-black-w) + var(--kb-gap)) / 2 * var(--kb-edge));
     display: flex;
     flex-direction: column;
     gap: 5px;
-    min-width: 290px;
-    touch-action: none;
+    /* 7 x 36 + 6 x 4 of keys, plus the reserve when the key needs it. The floor
+       is 36px rather than the pads' 44 because a white key is 76px TALL: the
+       reserve costs ~3px of width on a 360px phone, and buying it back by
+       scrolling a bed a child may never think to scroll costs more. */
+    min-width: calc(276px + var(--kb-reserve));
+    /* touch-action lives on the KEYS, not here: a touch that starts on a key
+       must not scroll (that is the glissando), but a touch that starts in a gap
+       must still be able to scroll the bed on the sub-320px phones where it is
+       the one thing wider than the well. */
   }
   .keybed-blacks {
     position: relative;
@@ -642,6 +684,7 @@ input[type='range']:disabled {
     display: grid;
     grid-template-columns: repeat(7, minmax(0, 1fr));
     gap: var(--kb-gap);
+    width: calc(100% - var(--kb-reserve));
   }
   @media (min-width: 640px) {
     .keybed {
@@ -691,11 +734,20 @@ input[type='range']:disabled {
     opacity: 0.36;
     background-image: linear-gradient(180deg, transparent, var(--k, #c084fc));
   }
-  .keybed-key[data-role='root']::before,
-  .keybed-key[data-role='fifth']::before {
+  .keybed-key[data-strong='true']::before {
     height: 36%;
     opacity: 0.8;
   }
+  /* A tablet gives the white keys ~108px of width; 76px of height beside that
+     reads as a row of buttons rather than a keybed, and the rack has the
+     vertical room a phone does not. AFTER the base rule on purpose — a media
+     query adds no specificity, so an earlier one would simply lose. */
+  @media (min-width: 640px) {
+    .keybed-key {
+      min-height: 96px;
+    }
+  }
+
   /* Where home is, without a letter or a numeral. */
   .keybed-home {
     position: absolute;
@@ -713,9 +765,9 @@ input[type='range']:disabled {
   /* The out-of-key notes: small, dark, dim — playable, clearly not the point.
      --kb-i is the gap this note sits in, counted in white keys from the left,
      so the key parks on the boundary between its two neighbours exactly as it
-     would on a piano. clamp() keeps the one that falls past the last white
-     key (the minor seventh's neighbour) inside the bed instead of half off
-     the right edge. */
+     would on a piano. The white row is 100% MINUS the reserve, so gap 7 — past
+     the last white key, where a minor key's leading tone lives — lands exactly
+     on the bed's right edge. clamp() is the belt to that braces. */
   .keybed-black {
     position: absolute;
     top: 0;
@@ -724,7 +776,8 @@ input[type='range']:disabled {
     left: clamp(
       0px,
       calc(
-        (100% - 6 * var(--kb-gap)) / 7 * var(--kb-i) + var(--kb-gap) * (var(--kb-i) - 0.5) - var(--kb-black-w) / 2
+        (100% - var(--kb-reserve) - 6 * var(--kb-gap)) / 7 * var(--kb-i) + var(--kb-gap) * (var(--kb-i) - 0.5) -
+          var(--kb-black-w) / 2
       ),
       calc(100% - var(--kb-black-w))
     );
@@ -801,11 +854,23 @@ input[type='range']:disabled {
     height: 100%;
   }
 
+  /* Wraps rather than squeezes. At 360px and up the readout and the two undo
+     buttons hold one line, with the chips on a line of their own when there
+     are any; at 320px the buttons drop to a line too. Words a child is meant
+     to read are never clipped to make a row fit. */
   .take-bar {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 6px;
     margin-top: 8px;
+  }
+  .take-acts {
+    display: flex;
+    flex: 0 0 auto;
+    align-items: stretch;
+    gap: 6px;
+    margin-left: auto;
   }
   .take-hint {
     flex: 0 0 auto;
@@ -830,9 +895,9 @@ input[type='range']:disabled {
     display: flex;
     align-items: center;
     gap: 5px;
-    flex: 1 1 auto;
+    /* Its own line, always: 100% basis cannot share one with anything. */
+    flex: 1 0 100%;
     min-width: 0;
-    overflow: hidden;
   }
   .take-chip {
     flex: 0 0 auto;

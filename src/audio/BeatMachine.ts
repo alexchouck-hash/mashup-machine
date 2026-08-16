@@ -283,7 +283,11 @@ export class BeatMachine {
    * Use `Object.values(bm.layers).some(Boolean)` if that is what you want.
    */
   get anyLayerOn(): boolean {
-    return this.anyGrooveLayerOn || this.hasTakes;
+    // DRUM takes only. A keyboard take is a melody, not a beat, and macros'
+    // ensureDrums() asks this question to decide whether the bridge already has
+    // drums to carry it. Counting a melody take here means a child who looped a
+    // tune and nothing else gets a "drum" bridge with no drums in it.
+    return this.anyGrooveLayerOn || this.drums.hasTakes;
   }
 
   /** The narrow question, for anyone who needs the pre-widening meaning. */
