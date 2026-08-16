@@ -95,8 +95,15 @@ export class AudioEngine {
 
   crossfade = 0.5;
   masterVolume = 1;
-  /** Sync: the follower deck is held continuously on the leader's beat grid. */
-  linkDecks = false;
+  /**
+   * Sync: the follower deck is held continuously on the leader's beat grid.
+   *
+   * ON by default. Two songs drifting apart is the failure a child can neither
+   * diagnose nor fix, and the assist layer's whole premise is that the app
+   * should not be able to sound wrong unless someone deliberately turns a
+   * safeguard off.
+   */
+  linkDecks = true;
   private linkTimer: number | null = null;
 
   recording = false;
@@ -242,6 +249,10 @@ export class AudioEngine {
     this.macros = new Macros(this);
 
     this.setCrossfade(this.crossfade);
+    // The link defaults on, so its controller has to be running from the start —
+    // setLink() is otherwise the only thing that ever starts it. Safe before any
+    // deck exists: holdLink() no-ops until there is a leader to follow.
+    if (this.linkDecks) this.startLinkLoop();
     this.ready = true;
     this.notify();
   }
