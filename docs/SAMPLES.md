@@ -57,12 +57,23 @@ than a clear infringement. The reason we still avoid it is asymmetry, not fear:
 the label costs nothing to change and the question costs something to answer, and
 this app may be sold.
 
-**So: never "808", "909" or "303" on a button, a filename, a pack label, or a
-store listing.** The drum pack with that character is called **Boom**.
+**OWNER DECISION, 2026-08-16: the pack is labelled "808".** The concern above was
+raised and the owner ruled to use the name. Recorded here as a deliberate,
+informed choice rather than an oversight, with the residual risk stated:
 
-Pack labels currently in use, all safe: **Boom**, **Trap**, **Hip-Hop**, **Rock**.
-Genre names are descriptive and not anyone's mark. Melody voices: **Guitar**,
-**Vocal**, **Synth**, **Xylo** — likewise descriptive.
+- The hyphenated marks **TR-808 / TR-909 / TB-303** remain off limits. "808" alone
+  is what ships.
+- Generic use of "808" is widespread and long-established in music, which is what
+  makes the bare number defensible. It is not risk-free, only low.
+- Should this ever need reversing, it is one string in `drumPacks.ts`. Nothing
+  about the audio, the files, or the licence depends on the label.
+
+**Filenames stay neutral regardless:** `bd_808` ships as `kick_deep`, because a
+filename is a durable identifier inside the repository and gains nothing from the
+brand. The decision above is about the user-facing pack label only.
+
+Pack labels in use: **808**, **Trap**, **Hip-Hop**, **Rock**. Melody voices:
+**Guitar**, **Vocal**, **Synth**, **Xylo** — all descriptive.
 
 ## Why brevity is not a defence
 
