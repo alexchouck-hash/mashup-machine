@@ -7,7 +7,8 @@ import { MELODY_VOICES } from '../audio/melodyVoices';
 import { JAMS, prewarmJams, renderJam, type JamSpec } from '../audio/jamFactory';
 import { downloadBlob, recordingFilename } from '../audio/wav';
 import { useEngineVersion } from '../hooks/useEngine';
-import { Turntable } from './Turntable';
+import type { PlatterLease } from '../audio/platter';
+import { Turntable, type TurntableHandle } from './Turntable';
 
 /**
  * Party Mode — the surface a child actually uses.
@@ -201,6 +202,10 @@ function SongTile({ deck, color }: { deck: Deck; color: string }) {
   useEngineVersion();
   const fileRef = useRef<HTMLInputElement>(null);
   const tileRef = useRef<HTMLDivElement>(null);
+  // Both live HERE, not in KidsMode: SongTile is instantiated per deck, and a
+  // single ref up in the parent would have two children writing one slot.
+  const leaseRef = useRef<PlatterLease | null>(null);
+  const ttRef = useRef<TurntableHandle>(null);
   const [rendering, setRendering] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
 
@@ -334,25 +339,40 @@ function SongTile({ deck, color }: { deck: Deck; color: string }) {
             className="flex-1 w-full flex flex-col items-center justify-center py-1.5 sm:py-2.5 px-3 transition"
           >
             <span className="relative block w-full">
+              {/* The three fan-out loops are gone. One acquire captures the group
+                  ONCE and the lease drives it: the grabbed deck follows the
+                  finger's absolute position, every partner follows only its
+                  SPEED, and that speed is a FRACTION of each record's own tempo
+                  rather than a raw hand rate — which is what stops a partner at
+                  +19% running 19% slow for the whole gesture. */}
               <Turntable
+                ref={ttRef}
                 deck={deck}
                 color={color}
                 onScratchStart={(e) => {
-                  for (const d of engine.scratchGroup(e.deck)) d.scratchStart();
+                  leaseRef.current = engine.platters.acquireFinger(e.deck, {
+                    positionSec: e.positionSec,
+                    // Losing the deck under the hand means this gesture is over.
+                    // Losing the fan-out partner to another child's finger does
+                    // NOT — each child keeps driving their own record.
+                    onRevoked: (d) => {
+                      if (d === e.deck) ttRef.current?.abort();
+                    },
+                  });
                 }}
                 onScratchMove={(e) => {
-                  for (const d of engine.scratchGroup(e.deck)) {
-                    // The grabbed deck follows the finger's absolute position; a
-                    // linked partner follows only its SPEED, since its own
-                    // playhead is somewhere else entirely in a different track.
-                    if (d === e.deck) d.scratchMove(e.positionSec, e.rate);
-                    else d.scratchRate(e.rate);
-                  }
+                  const l = leaseRef.current;
+                  if (!l) return;
+                  // Per frame, per deck, and deliberately no engine.notify().
+                  l.keepAlive();
+                  l.move(e.positionSec, e.rate);
                 }}
-                onScratchEnd={(e) => {
-                  for (const d of engine.scratchGroup(e.deck)) {
-                    d.scratchEnd(d === e.deck ? e.wasPlaying : undefined);
-                  }
+                onScratchEnd={() => {
+                  // Bare: the worklet resolves what the deck IS, not what it was
+                  // when the finger landed. Grab the annulus, toggle play, lift —
+                  // the toggle survives.
+                  leaseRef.current?.release();
+                  leaseRef.current = null;
                 }}
               />
               {/* The instruction a child needs, moved onto the record so it

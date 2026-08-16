@@ -90,6 +90,32 @@ const GATE_TAU = 0.004;
 /** Release inertia, overridable per surface via 'scratchInertia'. */
 const DEFAULT_RELEASE_TAU = 0.14;
 
+/**
+ * A HELD PLATTER IS A LEASE, NOT A LATCH.
+ *
+ * process() gates the hand-back on !scratchHeld, so scratchHeld === true is an
+ * UNBOUNDED lease by construction: a main thread that never runs again — a
+ * backgrounded tab, a swallowed pointercancel, a driver that threw — leaves this
+ * deck silent, reporting playing:true, forever, and nothing else in the app can
+ * reach it. That is the eight-second freeze, with no upper bound.
+ *
+ * "No message for N seconds" is NOT a valid staleness test here: Turntable
+ * deliberately stops emitting when the finger stops moving, and a hand resting on
+ * a stopped platter is legitimately silent. Hence an explicit keepalive at 5 Hz.
+ *
+ * THE NUMBER IS SET BY BACKGROUND TIMER CLAMPING, not by the ping rate — do not
+ * tighten it to "five misses at 5 Hz". Macros' 20 ms interval is the only
+ * keepalive a macro lease has, and every major engine throttles a background
+ * interval to roughly 1 Hz while this worklet keeps running at full rate; at 1.0 s
+ * the margin in the exact case this exists for (tap Tape stop, lock the phone) is
+ * approximately zero. 3.0 s still bounds a stranded platter an order of magnitude
+ * under the freeze it replaces.
+ *
+ * The clock is currentTime, so a suspended context freezes the TTL with the audio
+ * and it fires on resume, which is what you want.
+ */
+const LEASE_TTL_SEC = 3.0;
+
 /** One-pole coefficient for a time constant in seconds. */
 function poleK(tau) {
   return 1 - Math.exp(-1 / (Math.max(tau, 0.001) * sampleRate));
@@ -167,6 +193,8 @@ class StretchProcessor extends AudioWorkletProcessor {
     this.splicePos = 0;
     this.spliceLeft = 0;
     this.releaseAt = 0;
+    /** currentTime of the last message from whoever holds this platter. */
+    this.leaseAt = 0;
 
     // Coefficients are per-instance because they depend on sampleRate; computing
     // them here is what keeps the per-sample loop to one multiply-add.
@@ -238,6 +266,9 @@ class StretchProcessor extends AudioWorkletProcessor {
       case 'seek':
         if (this.scratchActive) {
           // Do NOT leave scratch — a cue jump under the hand is a needle drop.
+          // It also proves the driver is alive: macros' catch-up seek is the last
+          // thing that reaches this platter before the slam.
+          this.leaseAt = currentTime;
           this.splicePos = this.scratchPos;
           this.spliceLeft = SPLICE_FRAMES;
           this.scratchPos = clamp(m.frame, 0, Math.max(0, this.length - 1));
@@ -282,14 +313,21 @@ class StretchProcessor extends AudioWorkletProcessor {
       // ── Scratch protocol ───────────────────────────────────────────────
       case 'scratchOn': {
         if (this.length === 0) break;
+        this.leaseAt = currentTime;
         const hasFrame = Number.isFinite(m.frame);
         const hasVel = Number.isFinite(m.velocity);
         if (this.scratchActive) {
-          // Re-grabbing a platter that is still spinning down. Idempotent on
-          // purpose: a swallowed pointercancel followed by a fresh press must
-          // not trigger a second handover, which is the one path that clicks.
+          // Re-grabbing a platter that is still spinning down, or one whose
+          // previous owner was preempted. Idempotent on purpose: a swallowed
+          // pointercancel followed by a fresh press must not trigger a second
+          // handover, which is the one path that clicks.
+          //
+          // NOT a hard splice. The main thread's positionSecNow now extrapolates
+          // at the platter's REAL velocity, so the incoming driver seeds within a
+          // few frames of where the record actually is; forcing the 2.9 ms splice
+          // here would buy a scrape for an error near zero. Let it servo.
           this.scratchHeld = true;
-          if (hasFrame) this.applyJog(m.frame, true);
+          if (hasFrame) this.applyJog(m.frame, false);
           if (hasVel) this.velTarget = clamp(m.velocity, -VEL_MAX, VEL_MAX);
           break;
         }
@@ -320,26 +358,27 @@ class StretchProcessor extends AudioWorkletProcessor {
         // -1 = normal reverse, 0 = stopped. `scratchHeld` is owned by
         // scratchOn/scratchOff, never by a velocity update.
         if (!this.scratchActive || !Number.isFinite(m.value)) break;
+        this.leaseAt = currentTime;
         this.velTarget = clamp(m.value, -VEL_MAX, VEL_MAX);
         break;
       case 'scratchJog':
         if (!this.scratchActive || !Number.isFinite(m.frame)) break;
+        this.leaseAt = currentTime;
         this.applyJog(m.frame, m.hard === true);
+        break;
+      // "Still here." The one message that carries no intent: a hand resting on
+      // a stopped platter is legitimately silent, so liveness has to be stated
+      // rather than inferred from traffic.
+      case 'scratchKeepAlive':
+        this.leaseAt = currentTime;
         break;
       case 'scratchOff':
         if (!this.scratchActive) break;
-        this.scratchHeld = false;
-        // Resolve from LIVE transport state, not the entry snapshot: 'play',
-        // 'pause' and an idempotent re-grab can all change what the deck is
-        // while scratchActive is still true, and a bare scratchOff must restore
-        // what the deck IS, not what it was when the finger landed.
-        this.wantPlayAfter = m.play !== undefined ? !!m.play : this.playing;
-        this.velTarget = this.wantPlayAfter ? this.rate : 0;
-        this.releaseAt = currentTime;
-        // The UI's transport state settles now; the AUDIO settles over the
-        // spin-up. `vel` is deliberately not reset — the momentum at release
-        // is the throw.
-        this.playing = this.wantPlayAfter;
+        this.releaseScratch(m.play);
+        break;
+      // The reconciler's hammer, and genuinely unrefusable — see abortScratch.
+      case 'scratchAbort':
+        this.abortScratch(m.play);
         break;
       case 'scratchInertia':
         // A DJ surface may want 0.05 s; a kids surface a lazier 0.4 s.
@@ -352,6 +391,54 @@ class StretchProcessor extends AudioWorkletProcessor {
       default:
         break;
     }
+  }
+
+  /**
+   * THE ONE WAY A PLATTER IS HANDED BACK. Shared by scratchOff and the lease TTL,
+   * and factored precisely so the TTL provably takes the NORMAL exit rather than
+   * a parallel one.
+   *
+   * `play` omitted resolves from LIVE transport state, not from the entry
+   * snapshot: 'play', 'pause' and an idempotent re-grab can all change what the
+   * deck is while scratchActive is still true, and a bare release must restore
+   * what the deck IS, not what it was when the finger landed.
+   *
+   * Clearing scratchHeld ALONE would be a bug. maybeHandBack gates on
+   * `late = currentTime - releaseAt > limit`, so with releaseAt stale (zero, or
+   * seconds old) that is true immediately and the platter hands back at whatever
+   * velocity it happens to be at — a pitch snap, exactly what the 2%-of-rate exit
+   * threshold exists to prevent. Stamping releaseAt here is what makes the TTL
+   * spin the record UP over the normal 0.98 s instead of cutting it.
+   *
+   * `vel` is deliberately not reset: the momentum at release is the throw.
+   */
+  releaseScratch(play) {
+    this.scratchHeld = false;
+    this.wantPlayAfter = play !== undefined ? !!play : this.playing;
+    this.velTarget = this.wantPlayAfter ? this.rate : 0;
+    this.releaseAt = currentTime;
+    // The UI's transport state settles now; the AUDIO settles over the spin-up.
+    this.playing = this.wantPlayAfter;
+  }
+
+  /**
+   * Force the platter back NOW, for a main thread that has decided the two sides
+   * genuinely disagree.
+   *
+   * Distinct from releaseScratch, and the distinction is the whole point: a
+   * second scratchOff at a platter that is scratchActive && !scratchHeld RE-STAMPS
+   * releaseAt and pushes the `late` deadline out by another full window, so the
+   * "unrefusable hammer" would extend the disagreement it was written to end. This
+   * takes maybeHandBack's exit unconditionally. It may cost a pitch step; that is
+   * the correct price for a state that should not exist.
+   */
+  abortScratch(play) {
+    if (!this.scratchActive) return;
+    this.scratchHeld = false;
+    this.wantPlayAfter = play !== undefined ? !!play : this.playing;
+    this.velTarget = this.wantPlayAfter ? this.rate : 0;
+    this.playing = this.wantPlayAfter;
+    this.maybeHandBack(true);
   }
 
   resetStretch() {
@@ -641,14 +728,14 @@ class StretchProcessor extends AudioWorkletProcessor {
    * exponential never arrives, and 2% is 0.34 semitone — under the audible
    * step. The watchdog exists so scratch mode can never latch.
    */
-  maybeHandBack() {
+  maybeHandBack(force) {
     // The deadline has to scale with the time constant it guards. A one-pole
     // needs ~7 tau to cover a full-scale fling (ln(9/EXIT_EPS) = 6.1), so a
     // fixed 1.5 s truncates the spin-up the moment a surface asks for a lazier
     // release — handing back at the WRONG velocity, which is a pitch snap, and
     // defeating the inertia model that is the whole point of the feature.
     const limit = Math.min(4, Math.max(SPIN_MAX_SEC, 7 * this.releaseTau));
-    const late = currentTime - this.releaseAt > limit;
+    const late = force === true || currentTime - this.releaseAt > limit;
     if (this.wantPlayAfter) {
       const tol = EXIT_EPS * Math.max(1, Math.abs(this.rate));
       if (Math.abs(this.vel - this.rate) > tol && !late) return;
@@ -728,7 +815,20 @@ class StretchProcessor extends AudioWorkletProcessor {
 
     if (this.scratchActive) {
       this.sanitizeScratch();
-      if (!this.scratchHeld) this.maybeHandBack(); // may clear scratchActive
+      if (this.scratchHeld && currentTime - this.leaseAt > LEASE_TTL_SEC) {
+        // A REAL release, not a flag clear: it spins the record up over the
+        // normal window rather than cutting it at whatever velocity it is at.
+        this.releaseScratch(undefined);
+        // The only new worklet->main message, and it exists purely so a false
+        // timeout is observable in the console rather than inferred from a
+        // complaint. Every other transition is already carried by pos.scratching
+        // within 33 ms. Worst case on a false positive: the record spins up and
+        // the still-live driver re-acquires on its next keepAlive, which by the
+        // rules above is a servo, not a splice. Compare the case this replaces:
+        // silent, frozen, playing:true, unbounded.
+        this.port.postMessage({ type: 'platterYield' });
+      }
+      if (!this.scratchHeld) this.maybeHandBack(false); // may clear scratchActive
     }
 
     // Identical to the original `!this.playing || this.length === 0` whenever

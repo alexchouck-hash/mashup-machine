@@ -2,6 +2,7 @@ import { Deck } from './Deck';
 import { BeatMachine } from './BeatMachine';
 import { Fx } from './Fx';
 import { Macros } from './macros';
+import { Platters } from './platter';
 import { ensureKit } from './sampleKit';
 import { Transport } from './Transport';
 import { DEFAULT_ASSIST, type AssistSettings } from './types';
@@ -96,6 +97,13 @@ export class AudioEngine {
   macros!: Macros;
 
   decks: Deck[] = [];
+  /**
+   * Who may move a platter. Constructed with the engine rather than in init()
+   * because a Deck can be created before the first user gesture resolves, and a
+   * registry that did not exist yet would be a second nullable field to guard.
+   * It touches nothing until `initialized`.
+   */
+  readonly platters = new Platters(this);
   assist: AssistSettings = { ...DEFAULT_ASSIST };
 
   crossfade = 0.5;
@@ -261,6 +269,17 @@ export class AudioEngine {
     // setLink() is otherwise the only thing that ever starts it. Safe before any
     // deck exists: holdLink() no-ops until there is a leader to follow.
     if (this.linkDecks) this.startLinkLoop();
+
+    // The only lifecycle listeners in the app. The sole one anywhere else in
+    // src/ or public/ is Turntable's per-gesture window.blur, so an iOS home
+    // press mid-gesture strands both platters with no main-thread bound at all —
+    // the worklet's own TTL would be the only thing left, and it is deliberately
+    // sized for background timer clamping rather than for promptness.
+    window.addEventListener('pagehide', () => this.platters.panicRelease('teardown'));
+    window.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') this.platters.panicRelease('teardown');
+    });
+
     this.ready = true;
     this.notify();
   }
@@ -330,36 +349,20 @@ export class AudioEngine {
    */
   anchorNextBeatTime(): number | null {
     const a = this.anchorDeck();
-    if (!a?.analysis || !a.playing || a.scratching) return null;
+    if (!a?.analysis || !a.playing || a.platterBusy) return null;
     const phase = a.beatPhaseNow();
     if (phase == null) return null;
     const bpm = a.effectiveBpm || 120;
     return this.ctx.currentTime + (1 - phase) * (60 / bpm);
   }
 
-  /**
-   * Ride the beat grid on a scratch. The drums have no playhead to drag, so the
-   * gesture scales their GRID instead — a stopped platter stops the beat, a slow
-   * one slows it. Without this the drums march on through a scratch and the
-   * whole gesture stops sounding like one performance.
-   */
-  setScratchVelocity(v: number): void {
-    if (!this.ready) return;
-    const mag = Math.abs(Number.isFinite(v) ? v : 1);
-    this.transport.rateScale = Math.min(2, mag);
-  }
-
-  /**
-   * Hand the grid back, but only once NO platter is still held — two decks
-   * scratch together, and the first release must not restore the beat under a
-   * hand that is still moving. Phase is not corrected here: the transport's own
-   * snap re-acquires on the next beat, which is what makes it exit in sync.
-   */
-  releaseScratchVelocity(): void {
-    if (!this.ready) return;
-    if (this.decks.some((d) => d.scratching)) return;
-    this.transport.rateScale = 1;
-  }
+  // setScratchVelocity / releaseScratchVelocity are gone. They were 100+
+  // uncoordinated writes a second on transport.rateScale from every driver at
+  // once, and the release side carried a permanent-poison hazard: it returned
+  // early on `decks.some(d => d.scratching)`, so ONE stranded flag froze the drum
+  // grid for the rest of the party with no path back. There is one writer now,
+  // Platters.applyGrid, and it derives the value from the worklet's echo — see
+  // the comment there for why that also fixes the +19%-tempo unit bug.
 
   /** Follow the anchor deck's tempo while the beat is running. */
   syncBeatTempo(): void {
@@ -428,6 +431,12 @@ export class AudioEngine {
    * rule for scratching specifically — grabbing one record and having the other
    * carry on is the thing that sounds broken to everyone but a working DJ. Sync
    * still governs the BEAT lock; it no longer governs the platters.
+   *
+   * @internal ONE CALL SITE: Platters.acquireFinger, which evaluates it once and
+   * captures the result. The view layer no longer knows a group exists — it used
+   * to iterate this three times per gesture (start, every move, end), and the
+   * end recomputed a set that could differ from the start's, which is exactly how
+   * an eject mid-gesture left an acquired-never-released deck.
    */
   scratchGroup(deck: Deck): Deck[] {
     const all = this.decks.filter((d) => d.loaded);
@@ -456,11 +465,14 @@ export class AudioEngine {
 
     for (const d of this.decks) {
       // A platter under a hand owns itself; so does a deck with nothing to sync.
-      if (d === leader || !d.analysis || !d.playing || d.scratching) {
+      // `platterBusy`, not a gesture flag: the worklet keeps the record for up to
+      // 1.5 s of spin-up after a release, and this loop used to tick through that
+      // whole window on a deck it believed was free.
+      if (d === leader || !d.analysis || !d.playing || d.platterBusy) {
         d.setPhaseTrim(0);
         continue;
       }
-      if (leader.scratching) {
+      if (leader.platterBusy) {
         d.setPhaseTrim(0);
         continue;
       }

@@ -1,4 +1,5 @@
 import type { AudioEngine, CrossfadeAssign } from './AudioEngine';
+import type { PlatterLease, ScratchMsg } from './platter';
 import type { AnalysisResult, Peaks, VocalMode } from './types';
 import { computePeaks, monoDownmix } from './peaks';
 import { analyzeTrack } from '../analysis/analyzer';
@@ -9,12 +10,26 @@ const clamp = (v: number, lo: number, hi: number) => (v < lo ? lo : v > hi ? hi 
 const expMap = (t: number, from: number, to: number) => from * Math.pow(to / from, t);
 
 /**
- * How long a nominally-playing deck may sit motionless before we assume the
- * platter is stranded. Long enough that a legitimately paused-then-played deck
- * or a slow scratch release never trips it; short enough that a child does not
- * stand there wondering why the record stopped.
+ * How long a FREE deck may read as playing and sit motionless before we assume
+ * it is wedged. Long enough that a legitimately paused-then-played deck never
+ * trips it; short enough that a child does not stand there wondering why the
+ * record stopped.
  */
 const STALL_SEC = 0.6;
+
+/**
+ * The worklet's own DEFAULT_RELEASE_TAU, mirrored. The hand-back ceiling is
+ * derived from it rather than asserted, because the same design that exposes
+ * `PlatterGrab.inertiaSec` is the thing that would falsify a hard-coded 1.5 s:
+ * a 0.4 s inertia makes the worklet's own ceiling min(4, max(1.5, 7*tau)) = 2.8 s,
+ * and a grace asserted at 2.0 s would then fire in the middle of a perfectly
+ * legitimate spin-up. A constant that must stay true belongs in an expression,
+ * not in a sentence.
+ */
+const DEFAULT_RELEASE_TAU = 0.14;
+
+/** Message round trip plus one echo period, on top of the worklet's own ceiling. */
+const GRACE_MARGIN_SEC = 0.5;
 
 /**
  * Ceiling on the link's phase-correction rate offset.
@@ -95,8 +110,20 @@ export class Deck {
   vocalMode: VocalMode = 'both';
   /** RMS of the side signal relative to mid. 0 = mono, so nothing to cancel. */
   stereoWidth = 0;
-  /** A finger is on this platter. Set at the gesture boundaries only. */
-  scratching = false;
+  /**
+   * @internal The lease driving this platter, and its rank. WRITTEN ONLY BY
+   * platter.ts — everything else asks `platterBusy` and never asks who.
+   */
+  heldBy: PlatterLease | null = null;
+  heldRank = 0;
+  /** Mirrored from the 'pos' echo: the AUDIO THREAD's own answer, at 30–60 Hz. */
+  workletScratching = false;
+  /** Signed, source frames per output frame. The platter's TRUE speed. */
+  workletVel = 0;
+  /** @internal Release time constant currently installed in the worklet. */
+  releaseTauSec = DEFAULT_RELEASE_TAU;
+  /** ctx time the two sides started disagreeing about ownership, or 0. */
+  private disagreeSince = 0;
   /** ctx time the playhead stopped moving while nominally playing, or 0. */
   private stalledSince = 0;
   /** Transient rate offset holding a linked deck on the leader's grid. */
@@ -262,12 +289,105 @@ export class Deck {
    * Playhead extrapolated to right now. The worklet reports at 30 Hz, so the
    * raw value can be up to ~33 ms stale — enough to hear as a flam when the
    * beat machine aligns its grid to this. Extrapolating removes most of it.
+   *
+   * Extrapolated at WHAT THE PLATTER IS ACTUALLY DOING. The old form used the
+   * tempo-fader rate regardless, so during a scratch it reported a playhead
+   * running forward at 1.0x while the record was under a hand at -0.4x — and
+   * that value feeds Turntable's anchor seed and progress ring, macros.grab's
+   * posAtGrab, macros.grabbable's reverse-headroom test, beatPhaseNow, and
+   * through that holdLink and alignPhaseTo. Making it truthful is what lets a
+   * finger land mid-drop and take the servo branch instead of a hard splice.
    */
   get positionSecNow(): number {
-    if (!this.playing) return this.positionSec;
+    const vel = this.platterBusy ? this.workletVel : this.playing ? this.nominalRate : 0;
+    if (vel === 0) return this.positionSec;
     const elapsed = Math.max(0, this.engine.ctx.currentTime - this.posUpdatedAt);
-    const rate = (1 + this.tempoPercent / 100) * (1 + this.phaseTrim);
-    return Math.min(this.durationSec, this.positionSec + elapsed * rate);
+    // Two-sided: a reverse scratch extrapolates NEGATIVE, which the old
+    // Math.min(durationSec, ...) never bounded below.
+    return clamp(this.positionSec + elapsed * vel, 0, this.durationSec);
+  }
+
+  /**
+   * Under a driver, or still SETTLING back to the stretch engine. ASK THIS.
+   *
+   * The settling half is a fix for a bug independent of ownership: the old
+   * `scratching` covered the GESTURE, while the worklet keeps the platter for
+   * min(4, max(1.5, 7*releaseTau)) = 1.5 s afterwards, and holdLink ticked
+   * through that entire window on a deck it believed was free — computing phase
+   * from an extrapolation at the fader rate while the record ran at a hand's
+   * velocity, then needle-dropping it or re-pointing velTarget mid-spin-up.
+   * Correcting with garbage is worse than not correcting.
+   */
+  get platterBusy(): boolean {
+    return this.heldBy !== null || this.workletScratching;
+  }
+
+  /** This record's own normal speed, in the worklet's velocity units. */
+  get nominalRate(): number {
+    return (1 + this.tempoPercent / 100) * (1 + this.phaseTrim);
+  }
+
+  /**
+   * How long the two threads may legitimately disagree about ownership. Covers
+   * the message round trip AND the settling window, so no separate "settling"
+   * flag is needed — the grace IS the settling allowance.
+   */
+  get platterGraceSec(): number {
+    return Math.min(4, Math.max(1.5, 7 * this.releaseTauSec)) + GRACE_MARGIN_SEC;
+  }
+
+  /**
+   * THE ONE DOOR. Every scratch message in the app is posted here and nowhere
+   * else, and this line is the entire ownership guarantee.
+   *
+   * The old guards asked the wrong question: `if (!this.scratching) return` asks
+   * "is ANYONE scratching" where the caller meant "may *I* drive this". That is
+   * why a transient disagreement became permanent — the only call that could
+   * have freed the platter refused to send. This asks the right question, once,
+   * in the only place it matters, and it is per-DECK, so a lease that holds A
+   * but lost B is refused on B even if its own claim list is stale.
+   *
+   * @internal — reachable only with a PlatterLease, which only Platters mints.
+   */
+  platterPost(lease: PlatterLease, msg: ScratchMsg): void {
+    if (this.heldBy !== lease) return;
+    this.node.port.postMessage(msg);
+  }
+
+  /**
+   * @internal A needle drop under the hand. The door again, because the
+   * bookkeeping below must not run for a write the door would refuse.
+   */
+  platterSeek(lease: PlatterLease, positionSec: number, play: boolean): void {
+    if (this.heldBy !== lease) return;
+    const frame = clamp(
+      Math.round(positionSec * this.sampleRate),
+      0,
+      Math.max(0, this.lengthFrames - 1)
+    );
+    this.positionFrames = frame;
+    this.posUpdatedAt = this.engine.ctx.currentTime;
+    this.platterPost(lease, { type: 'seek', frame, play });
+  }
+
+  /**
+   * Unrefusable. The reconciler's hammer, and nothing else — a distinct message
+   * rather than a second scratchOff, because scratchOff at a platter that is
+   * scratchActive && !scratchHeld re-stamps the worklet's releaseAt and pushes
+   * its own deadline out by another window. @internal
+   */
+  platterForceOff(): void {
+    this.node.port.postMessage({ type: 'scratchAbort', play: this.playing });
+  }
+
+  /**
+   * A deck wedged for a NON-ownership reason. scratchOff is a no-op at the
+   * worklet when nothing is scratching, so the effective remedy for "playing but
+   * stopped" is the play — name it as its own method so the two intents stay
+   * legible, which is the point of splitting the watchdog at all. @internal
+   */
+  platterKick(): void {
+    this.node.port.postMessage({ type: 'play' });
   }
 
   get loaded(): boolean {
@@ -337,6 +457,15 @@ export class Deck {
     loop: boolean,
     known?: Partial<AnalysisResult>
   ): Promise<void> {
+    // BEFORE anything else, and for the same reason unload() does it: the
+    // worklet's 'load' handler calls resetScratch() FIRST, clearing scratchActive
+    // and scratchHeld silently. A lease that survived that would drive a dead
+    // port for a full grace period — every message dropped at
+    // `if (!this.scratchActive)`, positionSecNow extrapolating at a stale vel,
+    // the drum grid governed by a deck reading zero — and only then abort the
+    // gesture. An adult dropping an MP3 onto a tile a child is scratching is the
+    // live case; the tile's onDrop handler does not care whether a finger is down.
+    this.engine.platters.revoke(this, 'unloaded');
     try {
       this.fileName = name;
       this.durationSec = buffer.duration;
@@ -412,6 +541,11 @@ export class Deck {
 
   /** Return the deck to empty, so the picker comes back. */
   unload(): void {
+    // First, always. The eject button sits live and tappable during a gesture on
+    // the OTHER platter, and the worklet's 'unload' handler calls resetScratch()
+    // before clearing `channels` — so the claim has to go before the state it
+    // claims does. No message is needed; the worklet resets itself.
+    this.engine.platters.revoke(this, 'unloaded');
     this.pause();
     this.node.port.postMessage({ type: 'unload' });
     this.fileName = '';
@@ -434,34 +568,47 @@ export class Deck {
     this.engine.notify();
   }
 
-  private onWorkletMessage(m: { type: string; frame?: number; playing?: boolean; length?: number }): void {
+  /**
+   * The 'pos' echo already carries `vel` and `scratching` 30–60 times a second
+   * and the old parameter type dropped both on the floor. Widening it is the
+   * cheapest seam in the whole ownership design and costs nothing at runtime:
+   * the audio thread is the real owner, and it was already telling us.
+   */
+  private onWorkletMessage(m: {
+    type: string;
+    frame?: number;
+    playing?: boolean;
+    length?: number;
+    vel?: number;
+    scratching?: boolean;
+  }): void {
     switch (m.type) {
       case 'pos': {
         const prev = this.positionFrames;
         this.positionFrames = m.frame ?? 0;
         this.posUpdatedAt = this.engine.ctx.currentTime;
+        this.workletScratching = m.scratching === true;
+        this.workletVel = m.vel ?? (this.playing ? this.nominalRate : 0);
 
-        // Stall watchdog. A deck that reads as playing, is not under a finger,
-        // and has not moved for STALL_SEC is stuck — the worklet is holding a
-        // platter nobody is going to release. Free it rather than leave a dead
-        // deck on screen; a spurious scratchOff on a healthy deck is a no-op.
-        if (this.playing && !this.scratching && Math.abs(this.positionFrames - prev) < 2) {
-          if (this.stalledSince === 0) this.stalledSince = this.engine.ctx.currentTime;
-          else if (this.engine.ctx.currentTime - this.stalledSince > STALL_SEC) {
-            this.stalledSince = 0;
-            console.warn('[deck] stalled while playing — forcing the platter back');
-            this.node.port.postMessage({ type: 'scratchOff', play: true });
-            this.node.port.postMessage({ type: 'play' });
-          }
-        } else {
-          this.stalledSince = 0;
-        }
+        this.checkPlatterAgreement();
+        this.checkStalled(prev);
+        // Deadline sweep and the single rateScale write. Deliberately on this
+        // path and not on a timer: it is already the app's one 30–60 Hz tick per
+        // deck, and it never notifies React.
+        this.engine.platters.tick();
+
         if (m.playing !== undefined && m.playing !== this.playing) {
           this.playing = m.playing;
           this.engine.notify();
         }
         break;
       }
+      case 'platterYield':
+        // Not an error path, an observability one: the worklet took a lease back
+        // on its own deadline. If this ever prints during normal play, a driver
+        // stopped calling keepAlive while still believing it held the record.
+        console.warn('[deck] platter lease expired on the audio thread', this.id);
+        break;
       case 'ended':
         this.playing = false;
         this.engine.notify();
@@ -471,6 +618,73 @@ export class Deck {
         break;
       default:
         break;
+    }
+  }
+
+  /**
+   * The ownership half of the old stall watchdog, turned into a genuine
+   * DISAGREEMENT detector.
+   *
+   * The old predicate — `playing && !scratching && |Δframe| < 2` — was the exact
+   * COMPLEMENT of the state that strands a platter: disarmed in every stale-TRUE
+   * case (the one it was written for) and armed in every stale-FALSE case, where
+   * it could fire a spurious scratchOff at a platter a driver legitimately held.
+   *
+   * This is kept not because ownership is still racy but because the two threads
+   * are joined by a channel that can lose a grab or a release with no driver at
+   * fault: load and unload clear the worklet's scratch state, scratchOn at
+   * length 0 is dropped, and postMessage is not a delivery guarantee. Explicit
+   * ownership removes the RACES; it does not make the channel reliable.
+   *
+   * We check the disagreement itself rather than guessing at it from playhead
+   * motion — a platter is allowed to sit still under a hand for a minute, and
+   * that motion test was the old watchdog's entire false-positive surface.
+   */
+  private checkPlatterAgreement(): void {
+    const now = this.engine.ctx.currentTime;
+    if ((this.heldBy !== null) === this.workletScratching) {
+      this.disagreeSince = 0;
+      return;
+    }
+    if (this.disagreeSince === 0) {
+      this.disagreeSince = now;
+      return;
+    }
+    if (now - this.disagreeSince <= this.platterGraceSec) return;
+    this.disagreeSince = 0;
+    if (this.workletScratching) {
+      // Nobody claims it and the worklet still has it: a release was lost.
+      console.warn('[deck] platter held with no claim — forcing it back', this.id);
+      this.platterForceOff();
+    } else {
+      // We claim a platter the worklet is not scratching — it refused or lost
+      // the grab. Driving it would be writing into nothing; give it up loudly.
+      console.warn('[deck] claim over a platter the worklet does not hold', this.id);
+      this.engine.platters.revoke(this, 'stale');
+    }
+  }
+
+  /**
+   * The motion half, kept, re-keyed and demoted. It is not provably unnecessary:
+   * a node can be disconnected, a context suspended, produce() can wedge, and
+   * none of those are ownership failures, so nothing above catches them.
+   *
+   * Keyed on `platterBusy`, not on a scratch flag, so it is disarmed for the
+   * whole settle window as well as the gesture. With the claim model this should
+   * never fire for a scratch reason — if it does that is a bug report, not
+   * routine self-healing, hence the distinct message and the distinct remedy.
+   */
+  private checkStalled(prevFrames: number): void {
+    const now = this.engine.ctx.currentTime;
+    if (this.playing && !this.platterBusy && Math.abs(this.positionFrames - prevFrames) < 2) {
+      if (this.stalledSince === 0) this.stalledSince = now;
+      else if (now - this.stalledSince > STALL_SEC) {
+        this.stalledSince = 0;
+        console.warn('[deck] wedged while playing (NOT a scratch)', this.id);
+        this.platterKick();
+      }
+    } else {
+      this.stalledSince = 0;
     }
   }
 
@@ -560,8 +774,7 @@ export class Deck {
   }
 
   private pushRate(): void {
-    const rate = (1 + this.tempoPercent / 100) * (1 + this.phaseTrim);
-    this.node.port.postMessage({ type: 'rate', value: rate });
+    this.node.port.postMessage({ type: 'rate', value: this.nominalRate });
   }
 
   /**
@@ -613,81 +826,13 @@ export class Deck {
 
   /* --------------------------------------------------------------- scratch */
 
-  /**
-   * Grab the platter. The worklet swaps to its scratch engine — signed-rate
-   * resampled playback, so pitch bends with the hand and reverse works.
-   *
-   * Note what does NOT happen here: no pause(). The worklet keeps `playing`
-   * meaningful across a gesture on purpose, so a paused deck can still be
-   * scratched and a bare scratchEnd() restores whatever the deck actually is.
-   */
-  scratchStart(): void {
-    if (!this.loaded) return;
-    this.scratching = true;
-    this.node.port.postMessage({
-      type: 'scratchOn',
-      frame: this.positionSecNow * this.sampleRate,
-      velocity: 0,
-    });
-    // A grab stops the record, and the beat stops with it.
-    this.engine.setScratchVelocity(0);
-    this.engine.notify();
-  }
-
-  /**
-   * Mid-gesture update. DELIBERATELY SILENT — no engine.notify().
-   *
-   * A gesture emits up to ~60 of these a second, and two children means ~120.
-   * Notifying would re-render KidsMode and both song tiles on every one, which
-   * is exactly the per-frame React work the canvas rAF loops exist to avoid.
-   * Nothing UI-visible changes mid-gesture anyway; the platter draws itself from
-   * deck.positionSecNow.
-   */
-  scratchMove(positionSec: number, rate: number): void {
-    if (!this.scratching) return;
-    this.node.port.postMessage({ type: 'scratchJog', frame: positionSec * this.sampleRate });
-    this.node.port.postMessage({ type: 'scratchRate', value: rate });
-    this.engine.setScratchVelocity(rate);
-  }
-
-  /**
-   * Rate-only update, for a deck linked to a platter someone else is holding.
-   * It follows the hand's SPEED but keeps its own playhead — jogging it to the
-   * grabbed deck's absolute position would be meaningless across two tracks.
-   */
-  scratchRate(rate: number): void {
-    if (!this.scratching) return;
-    this.node.port.postMessage({ type: 'scratchRate', value: rate });
-    this.engine.setScratchVelocity(rate);
-  }
-
-  /**
-   * Release. `play` omitted means "restore whatever the deck is now".
-   *
-   * Posts UNCONDITIONALLY, even when this side already believes it is not
-   * scratching. That guard used to be an early return, and it turned a
-   * transient disagreement between this flag and the worklet into a permanent
-   * one: a macro and a finger overlapping can leave the worklet holding a
-   * dead-stopped platter while `scratching` reads false here, and then the only
-   * call that could free it refuses to send. The deck sits frozen, silent, and
-   * reporting `playing: true`, with nothing in the UI able to recover it.
-   * An extra scratchOff is free — the worklet drops it when not scratching.
-   */
-  scratchEnd(play?: boolean): void {
-    const wasScratching = this.scratching;
-    this.scratching = false;
-    this.node.port.postMessage({ type: 'scratchOff', play });
-    // Checked AFTER clearing the flag, so the last platter released is the one
-    // that hands the grid back. The transport re-acquires phase on its next
-    // beat, so the drums come back in time rather than wherever they stopped.
-    this.engine.releaseScratchVelocity();
-    if (wasScratching) this.engine.notify();
-  }
-
-  /** How lazily the platter spins back up after a release, in seconds. */
-  setScratchInertia(seconds: number): void {
-    this.node.port.postMessage({ type: 'scratchInertia', releaseSec: seconds });
-  }
+  // There is no scratchStart / scratchMove / scratchRate / scratchEnd here any
+  // more, and that is the point of the change. A platter is moved through a
+  // PlatterLease (src/audio/platter.ts) and through `platterPost` above, so the
+  // question "may I drive this deck" is answered once, at the port, per deck.
+  // Deleting the old four broke the build in exactly the places that needed
+  // reading — which is the enumeration step this project has twice paid for
+  // skipping.
 
   /** Shift by less than half a beat so our grid sits on theirs. */
   alignPhaseTo(other: Deck): void {

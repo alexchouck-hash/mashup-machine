@@ -1,5 +1,6 @@
 import type { AudioEngine } from './AudioEngine';
 import type { Deck } from './Deck';
+import type { PlatterLease } from './platter';
 import type { DrumLayer } from './BeatMachine';
 import type { VocalMode } from './types';
 import { metalBuffer, noiseBuffer, snare } from './drums';
@@ -315,15 +316,21 @@ interface TensionSnapshot {
   wroteTempo: number;
 }
 
-/** A platter this macro is holding, and the clock it was grabbed against. */
+/**
+ * A platter this macro is holding, and the clock it was grabbed against.
+ *
+ * `rate` used to live here too and is gone: the lease speaks in SPIN FRACTION —
+ * a multiple of each deck's own normal speed — so the wind-down envelope already
+ * IS a fraction and each deck multiplies by its own nominalRate at the door.
+ * spinUp's virtual playhead reads `deck.nominalRate` live instead, which is also
+ * more honest, since a tempo fader can move during a two-beat wind-down.
+ */
 interface HeldDeck {
   deck: Deck;
   /** Playhead at the grab, and the ctx time of that reading. Together they are a
    *  virtual playhead the stalled record can be caught back up to. */
   posAtGrab: number;
   grabAt: number;
-  /** The deck's own playback rate — "full speed" for this record. */
-  rate: number;
 }
 
 /** The optional deck-path shaper. See the headroom block above. */
@@ -383,6 +390,10 @@ export class Macros {
   private expected = 0;
   private tensed: TensionSnapshot[] = [];
   private held: HeldDeck[] = [];
+  /** Our claim on the platters. Null means we may not move a record at all. */
+  private lease: PlatterLease | null = null;
+  /** True once the wind-down envelope is finished and spinUp owns the velocity. */
+  private parked = false;
   /** Typed off WaveShaperNode so the Float32Array generic is not pinned here. */
   private driveCurve: WaveShaperNode['curve'] = null;
   private warned = false;
@@ -568,15 +579,24 @@ export class Macros {
       );
       this.afterIn(this.timers, back - SPIN_LEAD - this.ctx.currentTime, () => this.spinUp());
       this.afterIn(this.timers, back + SPIN_TAIL - this.ctx.currentTime, () => this.release());
-      // Belt and braces. A platter left held is a deck that reads as playing and
-      // makes no sound at all, and nothing else in the app would ever free it.
-      this.afterIn(this.timers, back + 1 - this.ctx.currentTime, () => this.release());
+      // The redundant safety release at back + 1.0 is GONE, and it is the one
+      // deletion here that had to be traded rather than taken for free. It is now
+      // actively hazardous: `lease` is a single field, so a stale timer from drop
+      // N firing during drop N+1 would release N+1's platters mid-effect. Three
+      // deadlines cover what it covered — the scheduled release above, the
+      // registry's idle sweep, and the worklet's own TTL, which is the only one
+      // that works with the main thread gone entirely.
     }
 
     this.active = 'drop';
     this.dropKind = k;
-    // Stay busy past the safety release, so a second tap cannot push a deck onto
-    // `held` that the first drop's release timer is about to let go of.
+    // Stay busy past the release timer, KEPT at the full second against the
+    // design's proposal to shrink it. It is what makes "two macro leases on one
+    // deck" unreachable, and equal rank loses: a second tap that got through
+    // would be declined on every platter, acquireMacro would return null, and the
+    // gate would cut and slam with no records moving and nothing to explain it.
+    // The main thread janking a setTimeout by a few hundred ms is routine on a
+    // tablet; the deleted second was cosmetic and the failure is not.
     this.busyUntil = back + (k === 'classic' ? 0.05 : 1.05);
     this.after(back - this.ctx.currentTime + 0.06, () => {
       this.active = this.latch;
@@ -591,10 +611,17 @@ export class Macros {
     return this.drop('classic', opts);
   }
 
-  /** Loaded, playing, and not already under somebody's finger. */
+  /**
+   * Loaded, playing, and not already under somebody's finger.
+   *
+   * A SCHEDULE-TIME estimate, two bars early; `acquireMacro` decides for real at
+   * fire time. A child grabbing a platter in between means the drop's spoken note
+   * over-promises slightly while the gate and the slam still play out — cosmetic,
+   * and the honest place for the imprecision.
+   */
   private grabbable(kind: DropKind): Deck[] {
     return this.engine.decks.filter((d) => {
-      if (!d.loaded || !d.playing || d.scratching) return false;
+      if (!d.loaded || !d.playing || d.platterBusy) return false;
       // A suck-back needs somewhere to go. Near the head of a track the platter
       // would pin at frame 0 and gate itself silent, which is not an effect.
       if (kind === 'reverse' && !d.loop && d.positionSecNow < REV_MIN_POS) return false;
@@ -826,41 +853,91 @@ export class Macros {
   /**
    * Take hold of the playing records and drive their velocity.
    *
-   * The one subtlety: Deck.scratchStart seeds the platter at velocity ZERO, so a
-   * bare grab is a dead stop, not a wind-down. The scratchRate immediately after
-   * it re-points the platter at the deck's own speed, and the worklet's 12 ms
-   * one-pole covers the ~4 ms of handover.
+   * The lease opens at `spin: 1` — this record's own normal speed — so there is
+   * no dead stop to recover from. The old two-step (scratchStart seeding
+   * velocity ZERO, then a scratchRate 4 ms later re-pointing it at the deck's
+   * speed) is gone along with the comment explaining why that gap was survivable.
+   *
+   * The per-deck `if (!d.loaded || d.scratching) continue` re-check is gone too,
+   * and NOT because it was wrong: it is now `tryClaim`, which decides the same
+   * question at the same instant but with the answer recorded where the writes
+   * actually happen. A child who grabbed a platter in the two bars since this was
+   * scheduled simply outranks us and keeps their record.
    */
   private grab(decks: Deck[], kind: DropKind, t0: number, t1: number): void {
-    // busyUntil should already make a second grab impossible, but an orphaned
-    // interval here would drive scratchRate on decks nothing is tracking, and
-    // there would be no way left to free them. One line buys that away.
+    // Kept deliberately, against the design's proposal to drop it. This is the
+    // only thing that kills an interval belonging to a lease we are about to
+    // replace or fail to acquire, and an orphaned interval is now MORE likely,
+    // not less: it survives past the wind-down to hold the lease alive.
     this.stopScratchTimer();
-    const span = Math.max(0.05, t1 - t0);
-    for (const d of decks) {
-      // Re-checked at fire time, not just at schedule time: two bars is plenty
-      // of time for a child to have grabbed the platter or unloaded the song.
-      if (!d.loaded || d.scratching) continue;
-      const rate = clamp(fin(1 + d.tempoPercent / 100, 1), 0.25, 4);
-      this.held.push({ deck: d, posAtGrab: d.positionSecNow, grabAt: this.ctx.currentTime, rate });
-      d.scratchStart();
-      d.scratchRate(rate);
-    }
-    if (!this.held.length) return;
 
+    const lease = this.engine.platters.acquireMacro(decks, {
+      spin: 1,
+      onRevoked: (d) => {
+        // A finger took this platter. Drop it from the bookkeeping so spinUp
+        // does not try to catch up a record it no longer drives, and tear the
+        // whole thing down once nothing is left.
+        this.held = this.held.filter((h) => h.deck !== d);
+        if (!this.lease?.live) {
+          this.stopScratchTimer();
+          this.lease = null;
+        }
+      },
+    });
+    if (!lease) {
+      // Every platter is under a finger. The gain automation is already on the
+      // timeline and will play out as a plain cut-and-slam, which is the honest
+      // degradation — but say so, because a drop with no moving records is
+      // otherwise indistinguishable from a bug.
+      console.warn('[macros] no platter granted; the drop lands without the records');
+      return;
+    }
+    this.lease = lease;
+    this.parked = false;
+
+    const now = this.ctx.currentTime;
+    for (const d of lease.decks) this.held.push({ deck: d, posAtGrab: d.positionSecNow, grabAt: now });
+
+    const span = Math.max(0.05, t1 - t0);
     this.scratchTimer = window.setInterval(() => {
+      const l = this.lease;
+      if (!l?.live) {
+        this.stopScratchTimer();
+        return;
+      }
       const u = clamp((this.ctx.currentTime - t0) / span, 0, 1);
+      if (u >= 1) {
+        // PAST THE WIND-DOWN THE ENVELOPE STOPS WRITING VELOCITY. The interval
+        // keeps running only to hold the lease alive across the silence: the gap
+        // from u >= 1 (at `cut`) to spinUp (at `back - SPIN_LEAD`) is
+        // `silenceBeats * beat - 0.045 s`, which at 60 bpm with silenceBeats up
+        // to 8 runs to seconds — long enough for the worklet to yield the platter
+        // mid-silence, after which spinUp's catch-up seek is declined and the
+        // record lands off the grid.
+        //
+        // But it must NOT keep writing spin(0). At least five ticks land between
+        // spinUp (back - 0.045) and release (back + 0.06), and every one of them
+        // would overwrite spinUp's spin(1) within 20 ms — the record would climb
+        // to ~81% of rate on the 12 ms constant, be dragged straight back down,
+        // and arrive at the downbeat at roughly 0.2x with the gate half open.
+        // That is a wrong-pitch smear exactly where SPIN_LEAD's 45 ms was
+        // engineered to deliver 97.6% of full speed, and it would freeze the drum
+        // grid through the slam as well, since applyGrid follows |workletVel|.
+        if (!this.parked) {
+          // The master gate is already at zero here, so parking is silent and
+          // only matters for where the record is when we catch it back up.
+          l.spin(0);
+          this.parked = true;
+        }
+        l.keepAlive();
+        return;
+      }
       const f =
         kind === 'reverse'
           ? 1 - REV_DEPTH * Math.pow(u, REV_SHAPE)
           : Math.pow(1 - u, STOP_SHAPE);
-      for (const h of this.held) h.deck.scratchRate(h.rate * f);
-      if (u >= 1) {
-        this.stopScratchTimer();
-        // Park it. The master gate is already at zero here, so this is silent
-        // and only matters for where the record is when we catch it back up.
-        for (const h of this.held) h.deck.scratchRate(0);
-      }
+      l.spin(f);
+      l.keepAlive();
     }, SCRATCH_TICK_MS);
   }
 
@@ -874,22 +951,40 @@ export class Macros {
    * song half a bar behind the drums for the rest of the night.
    */
   private spinUp(): void {
+    // FIRST LINE, and unconditional. This makes "spinUp is the last writer
+    // before release" true regardless of tick jitter, rather than true because
+    // the `u >= 1` branch above happens to behave. Belt and braces on the same
+    // failure, and the cheap half of it.
+    this.stopScratchTimer();
+    const lease = this.lease;
+    if (!lease?.live) return;
     const now = this.ctx.currentTime;
     for (const h of this.held) {
-      const virtual = h.posAtGrab + (now + SPIN_LEAD - h.grabAt) * h.rate;
-      h.deck.seekSeconds(this.wrapInto(h.deck, virtual - SPIN_ADVANCE * h.rate), true);
-      h.deck.scratchRate(h.rate);
+      const rate = clamp(fin(h.deck.nominalRate, 1), 0.25, 4);
+      const virtual = h.posAtGrab + (now + SPIN_LEAD - h.grabAt) * rate;
+      lease.seek(h.deck, this.wrapInto(h.deck, virtual - SPIN_ADVANCE * rate), true);
     }
+    // One write, in fractions: every record goes back to its OWN full speed.
+    lease.spin(1);
   }
 
-  /** Hand every platter back to the stretch engine. Idempotent by construction. */
+  /**
+   * Hand every platter back to the stretch engine. Idempotent by construction —
+   * the door refuses a lease that no longer holds the deck, so a hand that took
+   * over mid-drop is not yanked out from under the child.
+   *
+   * `true` is not a leftover, it is the drop's CONTRACT: the record comes back at
+   * the slam. A bare release resolves from live transport state, and a child who
+   * tapped the record graphic during the wind-down has set `playing` false
+   * underneath us — the worklet would then brake into the downbeat, hold the
+   * platter for the full hand-back deadline with the gate wide open, and cut
+   * dead, leaving the song silent for the rest of the session.
+   */
   private release(): void {
     this.stopScratchTimer();
-    const held = this.held;
     this.held = [];
-    // scratchEnd is a no-op on a deck that is not scratching, so a hand that
-    // took over mid-drop is not yanked out from under the child.
-    for (const h of held) h.deck.scratchEnd(true);
+    this.lease?.release(true);
+    this.lease = null;
   }
 
   private stopScratchTimer(): void {

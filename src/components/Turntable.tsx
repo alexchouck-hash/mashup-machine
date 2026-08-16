@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { forwardRef, useEffect, useImperativeHandle, useRef } from 'react';
 import type { Deck } from '../audio/Deck';
 
 /**
@@ -57,6 +57,22 @@ const RATE_TAU = 0.045;
 /** Each emit becomes a worklet seek, and seek costs a FIFO flush. Cap the rate. */
 const EMIT_MIN_MS = 16;
 const EMIT_MIN_SEC = 0.0005;
+
+/**
+ * Floor on the emit rate, independent of movement.
+ *
+ * The movement gate above is right about bandwidth and wrong about liveness: a
+ * hand that grabs, flings and then HOLDS STILL stops emitting entirely, and a
+ * platter driver whose liveness is inferred from traffic would then lose the
+ * record under a stationary finger — which is legitimate, common, and exactly
+ * what a scratch pause is. The re-emitted position is identical, so applyJog's
+ * error is zero and it takes the servo branch: audibly free.
+ *
+ * It is also the honest fix for the thing Fx's crackle bed documents at length —
+ * a motionless hand sends no further update — replacing a self-decaying envelope
+ * with a heartbeat.
+ */
+const HEARTBEAT_MS = 200;
 
 /** Spin-up / re-sync blend after release. */
 const RELEASE_MS = 140;
@@ -192,11 +208,18 @@ function buildPlatter(diameter: number, dpr: number, color: string, label: strin
   return c;
 }
 
-/** Absolute position at the grab, so an integrator can restore what it paused. */
+/**
+ * Absolute position at the grab.
+ *
+ * `wasPlaying` is deliberately NOT here. It was a snapshot taken at pointerdown
+ * and handed back at pointerup, so grabbing the annulus, toggling play and
+ * lifting silently undid the toggle. A release resolves from live transport
+ * state instead; a driver that genuinely has an intent (a macro's slam) states
+ * it at the release, where it is legible.
+ */
 export interface ScratchStart {
   deck: Deck;
   positionSec: number;
-  wasPlaying: boolean;
 }
 
 /**
@@ -217,7 +240,6 @@ export interface ScratchEnd {
   deck: Deck;
   positionSec: number;
   rate: number;
-  wasPlaying: boolean;
 }
 
 interface Props {
@@ -228,7 +250,24 @@ interface Props {
   onScratchEnd?: (e: ScratchEnd) => void;
 }
 
-export function Turntable({ deck, color, onScratchStart, onScratchMove, onScratchEnd }: Props) {
+/**
+ * What an owner of this platter can do to the PICTURE when it loses the record.
+ *
+ * `abort` is literally the existing endGesture, so it still fires onScratchEnd
+ * and the "exactly one end per start" invariant is untouched — the release lands
+ * on a dead lease and is a no-op through the door. This is cheap insurance, not
+ * load-bearing: every path that revokes a primary claim today (mode switch, tab
+ * hidden, idle expiry) also ends the gesture by another route. It exists so the
+ * drawn record cannot keep tracking a finger that no longer moves the audio.
+ */
+export interface TurntableHandle {
+  abort: () => void;
+}
+
+export const Turntable = forwardRef<TurntableHandle, Props>(function Turntable(
+  { deck, color, onScratchStart, onScratchMove, onScratchEnd },
+  ref
+) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const cacheRef = useRef<{ img: HTMLCanvasElement; key: string } | null>(null);
 
@@ -248,7 +287,6 @@ export function Turntable({ deck, color, onScratchStart, onScratchMove, onScratc
     accumRad: 0,
     anchorSec: 0,
     targetSec: 0,
-    wasPlaying: false,
     lastEmitMs: 0,
     lastEmitSec: 0,
     lastFrameMs: 0,
@@ -266,6 +304,8 @@ export function Turntable({ deck, color, onScratchStart, onScratchMove, onScratc
   });
   const onWindowGeometry = useRef(() => liveRef.current.reMeasure()).current;
   const onWindowBlur = useRef(() => liveRef.current.end()).current;
+
+  useImperativeHandle(ref, () => ({ abort: () => liveRef.current.end() }), []);
 
   const detachWindow = () => {
     window.removeEventListener('scroll', onWindowGeometry, true);
@@ -315,12 +355,7 @@ export function Turntable({ deck, color, onScratchStart, onScratchMove, onScratc
     g.pointerId = null;
     g.seeded = false;
     if (canvasRef.current) canvasRef.current.style.cursor = '';
-    cbRef.current.onScratchEnd?.({
-      deck,
-      positionSec: g.targetSec,
-      rate: g.rate,
-      wasPlaying: g.wasPlaying,
-    });
+    cbRef.current.onScratchEnd?.({ deck, positionSec: g.targetSec, rate: g.rate });
   };
 
   useEffect(() => {
@@ -356,8 +391,10 @@ export function Turntable({ deck, color, onScratchStart, onScratchMove, onScratc
     g.lastAngle = Math.atan2(dy, dx);
     g.seeded = true;
     g.accumRad = 0;
+    // Seeded from the platter's REAL position, which now extrapolates at what
+    // the record is actually doing — so landing on a platter a macro is winding
+    // down produces a first jog error near zero and a servo, not a splice.
     g.anchorSec = g.targetSec = clampTarget(deck, deck.positionSecNow);
-    g.wasPlaying = deck.playing;
     g.rate = 0;
     g.releaseAtMs = 0;
     g.swallowClick = true;
@@ -370,7 +407,7 @@ export function Turntable({ deck, color, onScratchStart, onScratchMove, onScratc
     window.addEventListener('blur', onWindowBlur);
     e.currentTarget.style.cursor = 'grabbing';
 
-    cbRef.current.onScratchStart?.({ deck, positionSec: g.targetSec, wasPlaying: g.wasPlaying });
+    cbRef.current.onScratchStart?.({ deck, positionSec: g.targetSec });
   };
 
   const onMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
@@ -442,7 +479,8 @@ export function Turntable({ deck, color, onScratchStart, onScratchMove, onScratc
         g.targetSec = t;
 
         const dSec = t - g.lastEmitSec;
-        if (now - g.lastEmitMs >= EMIT_MIN_MS && Math.abs(dSec) >= EMIT_MIN_SEC) {
+        const stale = now - g.lastEmitMs >= HEARTBEAT_MS;
+        if (now - g.lastEmitMs >= EMIT_MIN_MS && (Math.abs(dSec) >= EMIT_MIN_SEC || stale)) {
           cbRef.current.onScratchMove?.({
             deck,
             positionSec: t,
@@ -617,4 +655,4 @@ export function Turntable({ deck, color, onScratchStart, onScratchMove, onScratc
       }`}
     />
   );
-}
+});
