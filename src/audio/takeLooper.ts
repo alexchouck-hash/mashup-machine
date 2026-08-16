@@ -370,6 +370,13 @@ export class TakeLooper<S> {
    * (which has no try/catch), and three failures IN A ROW is what broken looks
    * like; three across an hour is just a long party.
    */
+  /**
+   * Whether committed loops PLAY. Off keeps every take intact — this is a mute,
+   * not a clear, so a child can drop the loops out for a chorus and bring the
+   * same ones back rather than rebuilding them.
+   */
+  enabled = true;
+
   private errs = 0;
   private dead = false;
 
@@ -626,7 +633,10 @@ export class TakeLooper<S> {
     if (this.dead) return;
     try {
       this.clock.observe(step, time);
+      // Committing still runs while muted: a take in progress must finish and be
+      // kept, or turning the loop off mid-phrase would quietly bin it.
       this.maybeCommit();
+      if (!this.enabled) return;
       if (this.stack.length === 0) return;
 
       const abs = this.clock.absStep;
@@ -810,7 +820,13 @@ export class TakeLooper<S> {
       // overlays earlier at its true position in the loop. Past eight bars a
       // child has stopped performing a loop and started noodling, and a
       // non-repeating 32-bar "loop" is not a loop.
-      const step = ((pos[i] % L) + L) % L;
+      // NORMALISED TO THE FIRST HIT: the loop starts at the left, where the
+      // child started playing, rather than wherever in the bar they happened to
+      // begin. Because L is a whole number of bars and playback is
+      // `absStep mod L`, step 0 always lands on a transport bar line — so
+      // starting at the left and having the beats line up are the same change,
+      // and the end is clipped to a whole bar by construction.
+      const step = (((pos[i] - lo) % L) + L) % L;
       const key = voice.keyOf(taps[i].p);
 
       let bucket = byStep[step];

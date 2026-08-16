@@ -185,6 +185,30 @@ export class BeatMachine {
     this.engine.notify();
   }
 
+  /**
+   * Loop mute, per surface. A mute rather than a clear: the takes survive, so a
+   * child can drop the beat out for a chorus and bring the SAME loops back
+   * instead of rebuilding them.
+   */
+  get drumLoopOn(): boolean {
+    return this.drums.enabled;
+  }
+
+  setDrumLoopOn(on: boolean): void {
+    this.drums.enabled = on;
+    this.syncClock();
+    this.engine.notify();
+  }
+
+  get keyLoopOn(): boolean {
+    return this.keys.looper.enabled;
+  }
+
+  setKeyLoopOn(on: boolean): void {
+    this.keys.looper.enabled = on;
+    this.engine.notify();
+  }
+
   /** Which of MELODY_VOICES the keyboard plays. */
   get voiceIndex(): number {
     return this.keys.voiceIndex;

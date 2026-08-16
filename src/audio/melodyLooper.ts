@@ -26,7 +26,12 @@ export const OCTAVE_LABELS = ['Low', 'Mid', 'High'] as const;
 const OCTAVES = [3, 4, 5];
 
 /** Idle silence that ends a melodic take. Longer than the drums': a phrase is longer. */
-const KEYS_IDLE_SEC = 5;
+/**
+ * 2 s, not 5. Five seconds of silence before a melody committed felt like the
+ * app had missed it — long enough for a child to assume nothing was recorded and
+ * start playing again, which then joined the same take.
+ */
+const KEYS_IDLE_SEC = 2;
 
 const clamp = (v: number, lo: number, hi: number): number => (v < lo ? lo : v > hi ? hi : v);
 

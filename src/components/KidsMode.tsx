@@ -956,6 +956,18 @@ function BeatsRow() {
       legend={
         <>
           <span className="legend">Beats</span>
+          {/* Mute, not clear — the loops survive, so a beat can drop out for a
+              chorus and come back without being rebuilt. */}
+          <button
+            onClick={() => bm.setDrumLoopOn(!bm.drumLoopOn)}
+            data-on={bm.drumLoopOn ? 'true' : 'false'}
+            aria-pressed={bm.drumLoopOn}
+            aria-label={bm.drumLoopOn ? 'Beat loop on' : 'Beat loop off'}
+            title={bm.drumLoopOn ? 'Loop is playing — tap to mute' : 'Loop is muted — tap to play'}
+            className="key key--sm"
+          >
+            {bm.drumLoopOn ? '🔊' : '🔇'}
+          </button>
           {/* A pack is a kit swap, so it re-voices the loops a child has already
               built — which is why it belongs on the legend beside the pads and
               not buried somewhere they cannot see what changed. */}
@@ -1067,6 +1079,16 @@ function KeysRow() {
       legend={
         <>
           <span className="legend">Keys</span>
+          <button
+            onClick={() => bm.setKeyLoopOn(!bm.keyLoopOn)}
+            data-on={bm.keyLoopOn ? 'true' : 'false'}
+            aria-pressed={bm.keyLoopOn}
+            aria-label={bm.keyLoopOn ? 'Melody loop on' : 'Melody loop off'}
+            title={bm.keyLoopOn ? 'Loop is playing — tap to mute' : 'Loop is muted — tap to play'}
+            className="key key--sm"
+          >
+            {bm.keyLoopOn ? '🔊' : '🔇'}
+          </button>
           {/* The instrument. Icons carry it for a child who cannot read the
               words, exactly as the drum pack switch does. */}
           <div className="seg seg--tight" role="group" aria-label="Instrument">
