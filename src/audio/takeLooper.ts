@@ -44,10 +44,13 @@ const STEPS_PER_BAR = 16;
 const MERGE_WINDOW_STEPS = 0.25;
 
 /**
- * Live taps are scheduled this far ahead so envelopes open on a block boundary
- * rather than mid-block. It is a CONSTANT offset applied to every tap, so the
- * whole-take phase shift at commit absorbs it completely; 4 ms is a tenth of the
- * flam threshold and reads as instant.
+ * Live taps are SCHEDULED this far ahead so envelopes open on a block boundary
+ * rather than mid-block. 4 ms is a fifth of the flam threshold and reads as
+ * instant.
+ *
+ * It is a scheduling artefact, NOT part of the recorded timing: the tap stores
+ * the moment the finger landed, so a take played with auto-beat-match off
+ * reproduces exactly what was played rather than what the scheduler did with it.
  */
 const LIVE_LEAD_SEC = 0.004;
 

@@ -196,6 +196,31 @@ export function ensureKit(ctx: BaseAudioContext): Promise<void> {
   return job;
 }
 
+/** Every name a pack or voice may reference. */
+export function kitNames(): string[] {
+  return Object.keys(KIT);
+}
+
+/**
+ * Dev-only check that every sample a pack asks for actually exists.
+ *
+ * `sample` is a plain string, so a typo is invisible to the compiler and the
+ * runtime treats it exactly like a file that failed to decode: silent fallback
+ * to synthesis. That is the failure this project keeps paying for — an
+ * expression that cannot fail cannot warn you. This makes it loud, once, at
+ * startup, in dev only.
+ */
+export function assertKitNames(names: readonly string[], where: string): void {
+  if (!import.meta.env.DEV) return;
+  const missing = names.filter((n) => !(n in KIT));
+  if (missing.length) {
+    console.error(
+      `[kit] ${where} references ${missing.length} name(s) not in the kit: ${missing.join(', ')}. ` +
+        `These will silently play synthesis instead of the sample.`
+    );
+  }
+}
+
 /** How much of the kit actually decoded, for diagnostics. */
 export function kitStatus(ctx: BaseAudioContext): { loaded: number; total: number } {
   return { loaded: bucket(ctx.sampleRate).size, total: Object.keys(KIT).length };

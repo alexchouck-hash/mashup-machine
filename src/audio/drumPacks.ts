@@ -1,8 +1,8 @@
 import { clap, hat, kick, openHat, rim, snare, tom } from './drums';
-import { kitBuffer } from './sampleKit';
+import { assertKitNames, kitBuffer } from './sampleKit';
 
 /**
- * The three beat-pad kits.
+ * The four beat-pad kits.
  *
  * SIX PADS, ROLES FIXED ACROSS ALL THREE PACKS. Pad 1 is always the boom
  * whatever pack is selected, so the labels never move under a child's finger.
@@ -10,8 +10,10 @@ import { kitBuffer } from './sampleKit';
  *
  * The packs are different in REGISTER and in DECAY LENGTH, not only in timbre:
  *  1 "Party" is bright and acoustic
- *  2 "Boom"  is deep and dark, with a ride where Party has an open hat
- *  3 "Robot" is short and electronic, with no acoustic tail anywhere
+ *  1 "808"     deep sub kick, electronic snare, cowbell
+ *  2 "Trap"    fat kick, hard snare, the shortest tick in the kit for fast hats
+ *  3 "Hip-Hop" round kick, dub snare, pedal hat, a snap instead of a bell
+ *  4 "Rock"    a real acoustic kit: heavy kick, hard snare, crash and ride
  *
  * SWITCHING PACKS RE-VOICES EVERY TAKE, including committed ones. That is
  * deliberate — a pack is a kit swap, so a child's loops change kit instantly,
@@ -78,45 +80,81 @@ const tomAt =
   (ctx, dest, time, gain, accent) =>
     tom(ctx, dest, time, hz, gain, accent);
 
+/** Names referenced below, checked against the kit at startup in dev. */
+function validatePacks(packs: DrumPack[]): DrumPack[] {
+  assertKitNames(
+    packs.flatMap((p) => p.slots.map((s) => s.sample)),
+    'DRUM_PACKS'
+  );
+  return packs;
+}
+
+/**
+ * The four packs the owner asked for: 808, Trap, Hip-Hop, Rock.
+ *
+ * On the name "808": the registered marks are TR-808 / TR-909 / TB-303, and the
+ * concern was raised and ruled on — the owner chose the label knowingly. See the
+ * Naming section of docs/SAMPLES.md. Note the FILE is still `kick_deep`; only the
+ * user-facing pack label carries the number, so reversing it is this one string.
+ *
+ * Every slot's gain and maxSec is part of the pack rather than the player, so a
+ * pack cannot cost headroom or smear a long tail at sixteenths.
+ */
 export const DRUM_PACKS: DrumPack[] = [
   {
-    name: 'Party',
+    name: '808',
     slots: [
-      { sample: 'kick', fallback: kick, gain: 0.9, maxSec: 0.9 },
-      { sample: 'snap', fallback: clap, gain: 0.85, maxSec: 0.6 },
+      // The deep sub kick this pack exists for. Long tail, so the bound matters.
+      { sample: 'kick_deep', fallback: kick, gain: 0.9, maxSec: 0.9 },
+      { sample: 'snare_elec', fallback: snare, gain: 0.85, maxSec: 0.6 },
       { sample: 'hat', fallback: hat, gain: 0.55, maxSec: 0.24 },
       { sample: 'hat_open', fallback: openHat, gain: 0.55, maxSec: 0.34 },
-      { sample: 'tom_mid', fallback: tomAt(130), gain: 0.7, maxSec: 0.5 },
+      { sample: 'tom_lo', fallback: tomAt(90), gain: 0.7, maxSec: 0.5 },
       { sample: 'cowbell', fallback: rim, gain: 0.6, maxSec: 0.3 },
     ],
   },
   {
-    name: 'Boom',
+    name: 'Trap',
     slots: [
-      { sample: 'kick_boom', fallback: kick, gain: 0.9, maxSec: 0.9 },
+      { sample: 'kick_fat', fallback: kick, gain: 0.9, maxSec: 0.9 },
       { sample: 'snare_hard', fallback: snare, gain: 0.85, maxSec: 0.6 },
-      { sample: 'hat_soft', fallback: hat, gain: 0.55, maxSec: 0.24 },
-      // A ride, not an open hat — the one substitution that makes this pack read
-      // as a different kit rather than as the same kit filtered.
-      { sample: 'ride', fallback: openHat, gain: 0.55, maxSec: 0.34 },
-      { sample: 'tom_lo', fallback: tomAt(90), gain: 0.7, maxSec: 0.5 },
-      { sample: 'wood', fallback: rim, gain: 0.6, maxSec: 0.3 },
-    ],
-  },
-  {
-    name: 'Robot',
-    slots: [
-      { sample: 'kick_tek', fallback: kick, gain: 0.9, maxSec: 0.9 },
-      { sample: 'snare_elec', fallback: snare, gain: 0.85, maxSec: 0.6 },
-      { sample: 'tick', fallback: hat, gain: 0.55, maxSec: 0.24 },
-      { sample: 'crash', fallback: openHat, gain: 0.55, maxSec: 0.34 },
-      // `till` is a short percussive tick, so its fallback tom is pitched high
-      // and reads as electronic rather than as a drum-kit tom.
-      { sample: 'till', fallback: tomAt(170), gain: 0.7, maxSec: 0.5 },
+      // Trap lives on fast hats, so the shortest tick in the kit takes the slot
+      // and the bound is tighter still — ten of these a bar is normal here.
+      { sample: 'tick', fallback: hat, gain: 0.55, maxSec: 0.18 },
+      { sample: 'hat_open', fallback: openHat, gain: 0.55, maxSec: 0.34 },
+      { sample: 'tom_hi', fallback: tomAt(170), gain: 0.7, maxSec: 0.5 },
       { sample: 'blip', fallback: rim, gain: 0.6, maxSec: 0.3 },
     ],
   },
+  {
+    name: 'Hip-Hop',
+    slots: [
+      { sample: 'kick', fallback: kick, gain: 0.9, maxSec: 0.9 },
+      { sample: 'snare_dub', fallback: snare, gain: 0.85, maxSec: 0.6 },
+      { sample: 'hat_pedal', fallback: hat, gain: 0.55, maxSec: 0.24 },
+      { sample: 'hat_soft', fallback: openHat, gain: 0.55, maxSec: 0.34 },
+      { sample: 'tom_mid', fallback: tomAt(130), gain: 0.7, maxSec: 0.5 },
+      { sample: 'snap', fallback: clap, gain: 0.6, maxSec: 0.3 },
+    ],
+  },
+  {
+    name: 'Rock',
+    slots: [
+      // A real acoustic kit rather than the same kit filtered: heavy kick,
+      // hard-hit snare, and cymbals instead of programmed hats.
+      { sample: 'kick_heavy', fallback: kick, gain: 0.9, maxSec: 0.9 },
+      { sample: 'snare_hard', fallback: snare, gain: 0.85, maxSec: 0.6 },
+      { sample: 'hat_pedal', fallback: hat, gain: 0.55, maxSec: 0.24 },
+      { sample: 'crash', fallback: openHat, gain: 0.5, maxSec: 0.4 },
+      { sample: 'tom_lo', fallback: tomAt(100), gain: 0.7, maxSec: 0.5 },
+      { sample: 'ride', fallback: rim, gain: 0.55, maxSec: 0.34 },
+    ],
+  },
 ];
+
+// Runs once at import, dev only. A mistyped sample name is invisible to the
+// compiler and degrades silently to synthesis, so it is checked out loud here.
+validatePacks(DRUM_PACKS);
 
 /**
  * Play a named kit sample, or report that there is none.

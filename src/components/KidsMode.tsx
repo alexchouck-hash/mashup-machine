@@ -2,8 +2,9 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { CSSProperties, ReactNode } from 'react';
 import { engine } from '../audio/AudioEngine';
 import type { Deck } from '../audio/Deck';
-import { DRUM_PACKS } from '../audio/drumKits';
-import { anchorKey, scaleOf } from '../audio/melody';
+import { DRUM_PACKS, type DrumPack } from '../audio/drumPacks';
+import { scaleOf } from '../audio/melody';
+import { anchorKey } from '../audio/melodyLooper';
 import { JAMS, prewarmJams, renderJam, type JamSpec } from '../audio/jamFactory';
 import { downloadBlob, recordingFilename } from '../audio/wav';
 import { useEngineVersion } from '../hooks/useEngine';
@@ -928,7 +929,7 @@ function BeatsRow() {
         <>
           <span className="legend">Beats</span>
           <div className="seg" role="group" aria-label="Drum pack">
-            {DRUM_PACKS.map((p, i) => (
+            {DRUM_PACKS.map((p: DrumPack, i: number) => (
               <button
                 key={p.name}
                 onClick={() => bm.setPack(i)}

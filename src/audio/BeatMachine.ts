@@ -162,6 +162,37 @@ export class BeatMachine {
   /** The keyboard, with its auto-tune and auto-beat-match toggles. */
   readonly keys: MelodyLooper;
 
+  /* --------------------------------------------------------- keyboard façade
+   *
+   * The UI reaches the keyboard through these rather than through `.keys`
+   * directly, so the two assists have ONE writer that also notifies. Setting
+   * `keys.autoTune` from a component would change the model without telling
+   * React, and the toggle would light a frame late or not at all.
+   */
+
+  /** Play a note now and record it into the open take. */
+  tapKey(midi: number, velocity = 1): number {
+    return this.keys.tap(midi, velocity);
+  }
+
+  get autoTune(): boolean {
+    return this.keys.autoTune;
+  }
+
+  setAutoTune(on: boolean): void {
+    this.keys.autoTune = on;
+    this.engine.notify();
+  }
+
+  get beatMatch(): boolean {
+    return this.keys.beatMatch;
+  }
+
+  setBeatMatch(on: boolean): void {
+    this.keys.beatMatch = on;
+    this.engine.notify();
+  }
+
   private engine: AudioEngine;
   private bus: GainNode;
   /** Canned groove voices only, so takes can duck the groove without ducking themselves. */

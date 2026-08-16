@@ -367,10 +367,14 @@ input[type='range']:disabled {
       font-size: 16px;
     }
   }
+  /* Lime by default, exactly as before. The three vars exist so a key that
+     belongs to another module (the keyboard's Tune / Beat toggles) can carry
+     that module's colour without a second copy of this rule. */
   .key[data-on='true'] {
-    border-color: #a3e635;
-    color: #bef264;
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12), 0 2px 0 #0b0f16, 0 0 16px rgba(163, 230, 53, 0.45);
+    border-color: var(--on, #a3e635);
+    color: var(--on-text, #bef264);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12), 0 2px 0 #0b0f16,
+      0 0 16px var(--on-glow, rgba(163, 230, 53, 0.45));
   }
   .key:active {
     transform: translateY(2px);
@@ -528,14 +532,363 @@ input[type='range']:disabled {
     text-transform: uppercase;
     letter-spacing: 0.14em;
   }
+
+  /* ======================================================================
+     THE LOOP PEDAL — beat pad, keybed, and the take furniture they share
+
+     Both surfaces are one machine in the engine and one component here, so
+     everything below is written once and used twice. The only per-frame
+     writes are `--lit` on a key, one transform on the countdown and the
+     strip's canvas; all of them come from a rAF loop reading the engine,
+     never from React.
+     ================================================================== */
+
+  /* A row that must not shrink its keys below a fingertip. Above ~300px of
+     well nothing ever scrolls; below it, the row scrolls instead of turning
+     into six 30px targets. */
+  .rack-scroll {
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    scroll-snap-type: x proximity;
+    scrollbar-width: none;
+    touch-action: pan-x;
+  }
+  .rack-scroll::-webkit-scrollbar {
+    display: none;
+  }
+
+  /* ------------------------------------------------------- the beat pad */
+  /* SIX pads in ONE row, always — a beat pad is horizontal or it is a grid
+     of buttons. On a 360px phone the well's inner width is 304px (360 − 16
+     page − 24 rack-row − 16 well), and 6 × 44 + 5 × 6 = 294px, so the row
+     fits with 10px to spare and stretches on anything larger. */
+  .beatpad {
+    display: grid;
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+    gap: 6px;
+    min-width: 294px;
+  }
+  .beatpad > .pad {
+    min-height: 68px;
+    padding: 8px 3px 6px;
+    scroll-snap-align: start;
+  }
+  .beatpad .pad-emoji {
+    font-size: 19px;
+  }
+  .beatpad .pad-label {
+    font-size: 8.5px;
+    letter-spacing: 0.03em;
+  }
+  @media (min-width: 640px) {
+    .beatpad > .pad {
+      min-height: 80px;
+    }
+    .beatpad .pad-emoji {
+      font-size: 24px;
+    }
+    .beatpad .pad-label {
+      font-size: 10px;
+    }
+  }
+
+  /* The lit wash. --lit is written by the rAF loop from the looper's flash
+     times, so a pad lights WITH its sound rather than up to 120ms early when
+     the step handler scheduled it — and a pad struck by the loop looks
+     exactly like a pad struck by a finger, because both go through here. */
+  .pad::after {
+    content: '';
+    position: absolute;
+    inset: -1px;
+    border-radius: inherit;
+    pointer-events: none;
+    opacity: var(--lit, 0);
+    background-image: radial-gradient(circle at 50% 44%, var(--pad-soft, rgba(255, 255, 255, 0.14)), transparent 72%);
+    box-shadow: inset 0 0 0 2px var(--pad, #e2e8f0), 0 0 22px var(--pad-glow, transparent);
+  }
+  .pad-led-on {
+    position: absolute;
+    inset: -1px;
+    border-radius: 50%;
+    opacity: var(--lit, 0);
+    background: var(--pad, #e2e8f0);
+    box-shadow: 0 0 9px var(--pad, #e2e8f0), inset 0 0 2px rgba(255, 255, 255, 0.9);
+  }
+
+  /* ---------------------------------------------------------- the keybed */
+  /* Piano-shaped but KEY-RELATIVE: the seven big keys are the seven notes of
+     the song's key with the root on the left, and the five small ones are the
+     chromatic in-betweens. The in-key notes are therefore the BIG targets, so
+     the highlight is structural as well as coloured and bad aim lands on a
+     note that works.
+
+     --kb-black-w is 36px, not the 40px first sketched, because the real well
+     is 304px wide and not 330: that makes a white key 40px, and a black key
+     may not be as wide as a white one. */
+  .keybed {
+    --kb-gap: 4px;
+    --kb-black-w: 36px;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    min-width: 290px;
+    touch-action: none;
+  }
+  .keybed-blacks {
+    position: relative;
+    height: 46px;
+  }
+  .keybed-whites {
+    display: grid;
+    grid-template-columns: repeat(7, minmax(0, 1fr));
+    gap: var(--kb-gap);
+  }
+  @media (min-width: 640px) {
+    .keybed {
+      --kb-black-w: 44px;
+      --kb-gap: 6px;
+    }
+    .keybed-blacks {
+      height: 54px;
+    }
+  }
+
+  .keybed-key,
+  .keybed-black {
+    position: relative;
+    border-radius: 3px 3px 9px 9px;
+    user-select: none;
+    touch-action: none;
+    -webkit-tap-highlight-color: transparent;
+    transition: transform 80ms ease, box-shadow 80ms ease;
+  }
+  .keybed-key:focus-visible,
+  .keybed-black:focus-visible {
+    outline: 2px solid #e2e8f0;
+    outline-offset: 2px;
+    z-index: 2;
+  }
+
+  /* Ivory, so a child recognises a keyboard instantly inside a dark rack. */
+  .keybed-key {
+    min-height: 76px;
+    border: 1px solid #05070b;
+    background-image: linear-gradient(180deg, #f3f6fb 0%, #dfe6f2 58%, #b9c3d6 100%);
+    box-shadow: inset 0 -3px 0 rgba(0, 0, 0, 0.16), 0 2px 0 #0b0f16, 0 4px 9px rgba(0, 0, 0, 0.5);
+  }
+  /* The in-key highlight: a band of the key's colour along the bottom, where
+     a finger is not covering it. Root and fifth — the two notes that cannot
+     sound wrong — get twice the band and twice the strength. */
+  .keybed-key::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 26%;
+    border-radius: 0 0 8px 8px;
+    pointer-events: none;
+    opacity: 0.36;
+    background-image: linear-gradient(180deg, transparent, var(--k, #c084fc));
+  }
+  .keybed-key[data-role='root']::before,
+  .keybed-key[data-role='fifth']::before {
+    height: 36%;
+    opacity: 0.8;
+  }
+  /* Where home is, without a letter or a numeral. */
+  .keybed-home {
+    position: absolute;
+    left: 50%;
+    bottom: 7px;
+    width: 8px;
+    height: 8px;
+    margin-left: -4px;
+    border-radius: 50%;
+    pointer-events: none;
+    background: #0b0f16;
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.5);
+  }
+
+  /* The out-of-key notes: small, dark, dim — playable, clearly not the point.
+     --kb-i is the gap this note sits in, counted in white keys from the left,
+     so the key parks on the boundary between its two neighbours exactly as it
+     would on a piano. clamp() keeps the one that falls past the last white
+     key (the minor seventh's neighbour) inside the bed instead of half off
+     the right edge. */
+  .keybed-black {
+    position: absolute;
+    top: 0;
+    height: 100%;
+    width: var(--kb-black-w);
+    left: clamp(
+      0px,
+      calc(
+        (100% - 6 * var(--kb-gap)) / 7 * var(--kb-i) + var(--kb-gap) * (var(--kb-i) - 0.5) - var(--kb-black-w) / 2
+      ),
+      calc(100% - var(--kb-black-w))
+    );
+    border: 1px solid #05070b;
+    background-image: linear-gradient(180deg, #2b3446 0%, #141a26 62%, #0c1017 100%);
+    box-shadow: 0 3px 0 #05070b, 0 5px 9px rgba(0, 0, 0, 0.6);
+  }
+
+  .keybed-key:active,
+  .keybed-black:active {
+    transform: translateY(2px);
+    box-shadow: inset 0 2px 6px rgba(0, 0, 0, 0.4);
+  }
+
+  /* Same --lit channel as the pads, so a key lights identically whether a
+     finger or a committed loop struck it — and, with auto-tune on, this is
+     what shows a child WHICH note their press was moved to. */
+  .keybed-glow {
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    pointer-events: none;
+    opacity: var(--lit, 0);
+    background-image: radial-gradient(ellipse at 50% 78%, var(--k, #c084fc), transparent 74%);
+    box-shadow: inset 0 0 0 2px var(--k, #c084fc), 0 0 18px var(--k-glow, transparent);
+  }
+
+  /* ------------------------------------------ open take: the well is armed */
+  /* Red border plus the draining countdown below it is the whole difference
+     between "I am still listening" and "this is looping now". */
+  .well[data-rec='true'] {
+    box-shadow: inset 0 2px 6px rgba(0, 0, 0, 0.62), 0 0 0 2px #ef4444, 0 0 20px rgba(239, 68, 68, 0.3);
+    animation: rec-breathe 1.15s ease-in-out infinite;
+  }
+  @keyframes rec-breathe {
+    50% {
+      box-shadow: inset 0 2px 6px rgba(0, 0, 0, 0.62), 0 0 0 2px #f87171, 0 0 30px rgba(239, 68, 68, 0.5);
+    }
+  }
+
+  /* The countdown: full on every tap, empty when the take commits. */
+  .take-count {
+    margin-top: 8px;
+    height: 5px;
+    border-radius: 3px;
+    overflow: hidden;
+    background: rgba(0, 0, 0, 0.4);
+    box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.7);
+  }
+  .take-count-fill {
+    display: block;
+    width: 100%;
+    height: 100%;
+    transform: scaleX(0);
+    transform-origin: left center;
+    background-image: linear-gradient(90deg, #ef4444, #fb7185);
+  }
+
+  /* Position strip: bar ticks, one mark per hit in its take's colour, the
+     open take's loose marks in red, and the playhead. Canvas because six
+     stacked takes over four bars is a few hundred marks at frame rate. */
+  .take-strip {
+    position: relative;
+    margin-top: 6px;
+    height: 26px;
+    border-radius: 7px;
+    overflow: hidden;
+    background: rgba(0, 0, 0, 0.42);
+    box-shadow: inset 0 2px 5px rgba(0, 0, 0, 0.65), inset 0 -1px 0 rgba(255, 255, 255, 0.03);
+  }
+  .take-strip canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+  }
+
+  .take-bar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 8px;
+  }
+  .take-hint {
+    flex: 0 0 auto;
+    padding: 3px 8px;
+    border-radius: 5px;
+    font-size: 9px;
+    font-weight: 800;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    white-space: nowrap;
+    color: #7d8798;
+    background: rgba(0, 0, 0, 0.35);
+    box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.7);
+  }
+  .take-hint[data-rec='true'] {
+    color: #fecaca;
+  }
+  /* One chip per committed loop, in that take's own colour — the same colour
+     its marks carry on the strip and its pads glow. Newest is outlined, so
+     "clear last" is never ambiguous about which one it takes. */
+  .take-chips {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+  }
+  .take-chip {
+    flex: 0 0 auto;
+    width: 20px;
+    height: 12px;
+    border-radius: 4px;
+    opacity: 0.85;
+    background: var(--c, #94a3b8);
+    box-shadow: 0 0 8px var(--c, #94a3b8);
+  }
+  .take-chip[data-newest='true'] {
+    opacity: 1;
+    outline: 2px solid rgba(255, 255, 255, 0.85);
+    outline-offset: 1px;
+  }
+
+  /* A .key that carries a word rather than a glyph. Must come after the 640px
+     .key rule above, which sets a fixed width. */
+  .key--text {
+    width: auto;
+    min-height: 40px;
+    padding: 0 11px;
+    font-size: 9.5px;
+    font-weight: 900;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    white-space: nowrap;
+  }
+  /* The keyboard's own two toggles, in the keyboard's colour. */
+  .key--keys {
+    --on: #c084fc;
+    --on-text: #e9d5ff;
+    --on-glow: rgba(192, 132, 252, 0.45);
+  }
+  /* Reset wipes everything a child built, so it asks twice: one tap arms it,
+     the second inside 2.6s does it. */
+  .key--danger[data-armed='true'] {
+    border-color: #ef4444;
+    color: #fecaca;
+    background-image: linear-gradient(180deg, #4a2027, #2a1218);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.1), 0 2px 0 #0b0f16, 0 0 16px rgba(239, 68, 68, 0.45);
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
   .pad,
   .key,
   .link-btn,
-  .seg-btn {
+  .seg-btn,
+  .keybed-key,
+  .keybed-black {
     transition: none;
+  }
+  /* The border still turns red; it just stops pulsing. */
+  .well[data-rec='true'] {
+    animation: none;
   }
 }
 
