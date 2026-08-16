@@ -1,5 +1,6 @@
 import { pluck, stab } from './melody';
 import { assertKitNames, kitBuffer } from './sampleKit';
+import { makeExpression, type VoiceHandle } from './expression';
 
 /**
  * The four keyboard voices: Guitar, Vocal, Synth, Xylo.
@@ -153,6 +154,59 @@ export function voiceRate(midi: number, root: number): number {
   while (rate > RATE_MAX && guard++ < 12) rate /= 2;
   while (rate < RATE_MIN && guard++ < 12) rate *= 2;
   return clamp(rate, RATE_MIN, RATE_MAX);
+}
+
+/**
+ * Play a note NOW and hand back a handle, so a finger still on the key can bend
+ * and swell it. The scheduled path (`playVoiceSample`) stays handle-free — a
+ * sequenced note has no gesture and must not pay for a chain it will not use.
+ *
+ * `Synth` is the one voice that returns DEAD_HANDLE by design: it is genuinely
+ * synthesized, its oscillators are built inside melody.ts with no exposed
+ * frequency param, and threading one through for the sake of a bend the other
+ * three voices already give is not worth the surface. The UI can read
+ * `handle.canBend` and dim the horizontal axis.
+ */
+export function playVoiceLive(
+  ctx: BaseAudioContext,
+  dest: AudioNode,
+  voice: MelodyVoice,
+  midi: number,
+  hz: number,
+  level: number,
+  durSec: number
+): VoiceHandle {
+  const t = ctx.currentTime;
+
+  if (voice.sample) {
+    const buf = kitBuffer(ctx, voice.sample);
+    if (buf) {
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      const rate = voiceRate(midi, voice.rootMidi);
+      src.playbackRate.value = rate;
+
+      const { input, handle } = makeExpression(ctx, dest, level, src.playbackRate, rate);
+
+      const avail = buf.duration / rate;
+      const dur = Math.min(durSec, voice.maxSec, avail);
+      const env = ctx.createGain();
+      env.gain.setValueAtTime(1, t);
+      env.gain.setValueAtTime(1, t + dur * 0.7);
+      env.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+
+      src.connect(env).connect(input);
+      src.start(t);
+      src.stop(t + dur + 0.02);
+      return handle;
+    }
+  }
+
+  // Synthesized, or a sample that has not decoded yet. Level still works,
+  // because the gain node is ours; bend does not, and says so.
+  const { input, handle } = makeExpression(ctx, dest, 1, null, 1);
+  voice.synth(ctx, input, t, hz, durSec, level);
+  return handle;
 }
 
 /**

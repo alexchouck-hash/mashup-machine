@@ -1,5 +1,6 @@
 import { clap, hat, kick, openHat, rim, snare, tom } from './drums';
 import { assertKitNames, kitBuffer } from './sampleKit';
+import { DEAD_HANDLE, makeExpression, type VoiceHandle } from './expression';
 
 /**
  * The four beat-pad kits.
@@ -169,6 +170,61 @@ validatePacks(DRUM_PACKS);
  * AudioBuffer | null, so nothing async and nothing throwing goes near the
  * transport's step handler.
  */
+/**
+ * Play a pad NOW and hand back a handle, so a finger still on the pad can bend
+ * and swell the note it just struck.
+ *
+ * Separate from `padVoice` on purpose: a SCHEDULED hit has no gesture attached
+ * and must not pay for a chain it will never use, while a LIVE hit needs the
+ * gain and playbackRate to outlive the call. See expression.ts.
+ *
+ * Returns DEAD_HANDLE rather than null when the sample is missing, so the caller
+ * still gets a sound (the synthesis fallback) and a handle whose methods are
+ * simply inert — the level axis degrades to nothing rather than to a crash.
+ */
+export function padVoiceLive(
+  ctx: BaseAudioContext,
+  dest: AudioNode,
+  spec: PadSpec,
+  gain: number,
+  vel: number
+): VoiceHandle {
+  const g = clamp(fin(gain, 1), 0, 4) * spec.gain;
+  const v = clamp(fin(vel, 1), 0, 1);
+  const t = ctx.currentTime;
+
+  const buf = kitBuffer(ctx, spec.sample);
+  if (!buf) {
+    // Synthesised fallback: audible, but nothing here is modulatable.
+    spec.fallback(ctx, dest, t, g, v);
+    return DEAD_HANDLE;
+  }
+
+  const src = ctx.createBufferSource();
+  src.buffer = buf;
+  const dur = Math.min(clamp(fin(spec.maxSec, 0.3), 0.02, 4) * velTime(v), buf.duration);
+
+  const { input, handle } = makeExpression(
+    ctx,
+    dest,
+    clamp(g * velAmp(v), FLOOR, 8),
+    src.playbackRate,
+    1
+  );
+
+  // The envelope lives on a node INSIDE the expression chain, so the gesture's
+  // gain writes and the tail ride cannot fight over one param.
+  const env = ctx.createGain();
+  env.gain.setValueAtTime(1, t);
+  env.gain.setValueAtTime(1, t + dur * 0.72);
+  env.gain.exponentialRampToValueAtTime(FLOOR, t + dur);
+
+  src.connect(env).connect(input);
+  src.start(t);
+  src.stop(t + dur + 0.02);
+  return handle;
+}
+
 function sampleVoice(
   ctx: BaseAudioContext,
   dest: AudioNode,
