@@ -3,6 +3,8 @@ export type StepHandler = (step: number, time: number) => void;
 const STEPS_PER_BAR = 16;
 const LOOKAHEAD_MS = 25;
 const SCHEDULE_AHEAD = 0.12;
+/** Per-beat phase correction ceiling. Below the flam threshold, so inaudible. */
+const MAX_PHASE_CORRECTION = 0.004;
 
 /**
  * 16th-note clock for the beat machine.
@@ -23,6 +25,18 @@ export class Transport {
   private nextTime = 0;
   private step = 0;
   private timer: number | null = null;
+  /**
+   * Optional phase reference: returns the ctx time the next BEAT should land
+   * on, or null when there is nothing to follow.
+   *
+   * Aligning once at start is not enough. The transport accumulates step times
+   * from a BPM estimate while a deck plays back sample-accurately, so any error
+   * in that estimate integrates into audible drift — and drums started before a
+   * track were never aligned at all. This lets the clock keep tracking the
+   * music instead of merely starting with it.
+   */
+  beatPhaseSource: (() => number | null) | null = null;
+
   private handlers = new Set<StepHandler>();
   /** Scheduled steps awaiting their moment, for driving beat-synced visuals. */
   private queue: Array<{ step: number; time: number }> = [];
@@ -66,6 +80,21 @@ export class Transport {
   private tick(): void {
     if (!this.running) return;
     while (this.nextTime < this.ctx.currentTime + SCHEDULE_AHEAD) {
+      // Once per beat, nudge the grid toward the music. The correction is
+      // capped at 4 ms — far below the ~20 ms flam threshold, so it is
+      // inaudible per beat, but at up to 8 ms/s it tracks any realistic drift.
+      // Errors are folded to +/- half a beat: we lock to the BEAT grid, not to
+      // a particular downbeat, which is what keeps drums sounding "in time".
+      if (this.beatPhaseSource && this.step % 4 === 0) {
+        const want = this.beatPhaseSource();
+        if (want != null && Number.isFinite(want)) {
+          const beat = this.stepDuration * 4;
+          let err = want - this.nextTime;
+          err -= Math.round(err / beat) * beat;
+          this.nextTime += Math.max(-MAX_PHASE_CORRECTION, Math.min(MAX_PHASE_CORRECTION, err));
+        }
+      }
+
       for (const h of this.handlers) h(this.step, this.nextTime);
       this.queue.push({ step: this.step, time: this.nextTime });
       this.nextTime += this.stepDuration;

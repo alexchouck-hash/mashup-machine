@@ -449,12 +449,17 @@ export class Deck {
     }
     this.node.port.postMessage({ type: 'play' });
     this.playing = true;
+    // A deck starting or stopping can change WHICH deck the drums should
+    // follow, so the beat clock re-reads its anchor here rather than only when
+    // a tempo fader moves.
+    this.engine.syncBeatTempo();
     this.engine.notify();
   }
 
   pause(): void {
     this.node.port.postMessage({ type: 'pause' });
     this.playing = false;
+    this.engine.syncBeatTempo();
     this.engine.notify();
   }
 

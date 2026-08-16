@@ -74,34 +74,582 @@ input[type='range']:disabled {
   opacity: 0.3;
 }
 
-/* Party Mode mix fader: chunky enough for a child's finger. */
-.kid-slider {
-  height: 46px;
+/* ==========================================================================
+   PARTY MODE HARDWARE SURFACE
+
+   The lower half of Party Mode is one piece of equipment: a rack chassis with
+   silkscreen legends, recessed wells, moulded keys and a console fader. It is
+   presentation only — every rAF loop (visualizer, beat pulse, step dots,
+   platter) still reads the engine directly and nothing here runs per frame.
+   ========================================================================== */
+
+@layer components {
+  /* ------------------------------------------------------------- chassis */
+  .rack {
+    position: relative;
+    border-radius: 14px;
+    border: 1px solid #2a3244;
+    background-color: #131720;
+    /* A barely-there brushed grain. At 1.4% it reads as metal under the
+       inset shadows and vanishes entirely on a phone, which is the point. */
+    background-image: repeating-linear-gradient(115deg, rgba(255, 255, 255, 0.014) 0 1px, transparent 1px 3px),
+      linear-gradient(180deg, #1a202c 0%, #131720 38%, #0f131b 100%);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06), inset 0 -2px 6px rgba(0, 0, 0, 0.5),
+      0 6px 18px rgba(0, 0, 0, 0.45);
+  }
+  /* Bezel screws. pointer-events:none or the corner of the chassis eats the
+     tap meant for whatever sits under it. */
+  .rack::before,
+  .rack::after {
+    content: '';
+    position: absolute;
+    top: 8px;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    pointer-events: none;
+    background-image: linear-gradient(42deg, transparent 43%, rgba(0, 0, 0, 0.8) 43% 57%, transparent 57%),
+      radial-gradient(circle at 34% 32%, #3a4359, #151a24 72%);
+    box-shadow: inset 0 1px 1px rgba(0, 0, 0, 0.9), 0 1px 0 rgba(255, 255, 255, 0.06);
+  }
+  .rack::before {
+    left: 10px;
+  }
+  .rack::after {
+    right: 10px;
+  }
+
+  .rack-row {
+    padding: 10px 12px 12px;
+  }
+  /* The first legend has to clear the bezel screws, which live at the top
+     edge of the chassis rather than inside any one row. */
+  .rack-row:first-child {
+    padding-top: 20px;
+  }
+  .rack-row + .rack-row {
+    border-top: 1px solid rgba(255, 255, 255, 0.045);
+    box-shadow: inset 0 1px 0 rgba(0, 0, 0, 0.6);
+  }
+
+  /* ---------------------------------------------------- silkscreen legend */
+  .legend {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+    font-size: 9px;
+    font-weight: 800;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: #5b6679;
+    text-shadow: 0 1px 0 rgba(0, 0, 0, 0.85);
+  }
+  .legend::after {
+    content: '';
+    flex: 1;
+    height: 1px;
+    background: linear-gradient(90deg, rgba(255, 255, 255, 0.09), transparent);
+  }
+  /* A legend that shares its line with a control. Explicit child rules rather
+     than utility overrides, so the layer order can never decide this. */
+  .legend-bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 8px;
+  }
+  .legend-bar .legend {
+    flex: 1 1 auto;
+    min-width: 0;
+    margin-bottom: 0;
+  }
+  .legend-bar .seg {
+    flex: 0 0 auto;
+  }
+  /* Small LCD strip for the macro readout. */
+  .note-readout {
+    flex: 0 1 auto;
+    min-width: 0;
+    max-width: 62%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    padding: 3px 8px;
+    border-radius: 5px;
+    font-size: 10px;
+    color: #a5b4c8;
+    background: rgba(0, 0, 0, 0.35);
+    box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.7);
+  }
+
+  /* The recess a bank of keys sits in. */
+  .well {
+    border-radius: 12px;
+    padding: 8px;
+    background: rgba(0, 0, 0, 0.3);
+    box-shadow: inset 0 2px 6px rgba(0, 0, 0, 0.62), inset 0 -1px 0 rgba(255, 255, 255, 0.04);
+  }
+
+  /* auto-fit, not a fixed column count: a Magic row that gains a seventh pad
+     tomorrow re-flows instead of orphaning it, and empty tracks collapse so
+     four pads still stretch edge to edge. min(...,100%) stops a 300px phone
+     from overflowing. */
+  .pad-grid {
+    display: grid;
+    gap: 8px;
+    grid-template-columns: repeat(auto-fit, minmax(min(var(--pad-min, 84px), 100%), 1fr));
+  }
+
+  /* ------------------------------------------------------- one hardware key */
+  .pad {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 2px;
+    padding: 10px 4px 8px;
+    border-radius: 12px;
+    border: 1px solid #333c53;
+    background-image: linear-gradient(180deg, #2a3247 0%, #1c2231 52%, #151a26 100%);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.09), inset 0 -2px 0 rgba(0, 0, 0, 0.5), 0 2px 0 #0b0f16,
+      0 4px 9px rgba(0, 0, 0, 0.55);
+    color: #94a3b8;
+    font-weight: 900;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    user-select: none;
+    touch-action: none;
+    -webkit-tap-highlight-color: transparent;
+    transition: transform 90ms ease, box-shadow 90ms ease, color 150ms ease, border-color 150ms ease;
+  }
+  .pad-emoji {
+    font-size: 21px;
+    line-height: 1;
+  }
+  .pad-label {
+    font-size: 9.5px;
+    line-height: 1.1;
+    text-align: center;
+  }
+  @media (min-width: 640px) {
+    .pad-emoji {
+      font-size: 25px;
+    }
+    .pad-label {
+      font-size: 11px;
+    }
+  }
+
+  .pad-led {
+    position: absolute;
+    top: 5px;
+    right: 6px;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #0e131d;
+    box-shadow: inset 0 1px 1px rgba(0, 0, 0, 0.9), 0 0 0 1px rgba(255, 255, 255, 0.07);
+  }
+  /* --pad / --pad-soft / --pad-glow come from the call site's existing hex
+     colour, so a pad added later inherits all of this for free. */
+  .pad[data-on='true'] {
+    border-color: var(--pad, #e2e8f0);
+    color: var(--pad, #e2e8f0);
+    background-image: linear-gradient(180deg, var(--pad-soft, rgba(255, 255, 255, 0.13)), #151a26 72%);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.14), inset 0 -2px 0 rgba(0, 0, 0, 0.5), 0 2px 0 #0b0f16,
+      0 0 20px var(--pad-glow, transparent);
+  }
+  .pad[data-on='true'] .pad-led {
+    background: var(--pad, #e2e8f0);
+    box-shadow: 0 0 9px var(--pad, #e2e8f0), inset 0 0 2px rgba(255, 255, 255, 0.9);
+  }
+  /* Sink and lose the drop shadow — a key bottoming out. A scale reads as a
+     soft app button, which is exactly what this is not. */
+  .pad:active {
+    transform: translateY(2px);
+    box-shadow: inset 0 2px 5px rgba(0, 0, 0, 0.7), 0 1px 2px rgba(0, 0, 0, 0.5), 0 0 14px var(--pad-glow, transparent);
+  }
+  .pad:focus-visible {
+    outline: 2px solid #e2e8f0;
+    outline-offset: 2px;
+  }
+  /* Grey AND dim AND pressed-in. Opacity alone on a dark panel reads as "just
+     a dim button" to a child, who then taps it repeatedly. */
+  .pad:disabled {
+    opacity: 0.32;
+    filter: grayscale(0.7);
+    transform: none;
+    pointer-events: none;
+    background-image: linear-gradient(180deg, #171c27, #12161f);
+    box-shadow: inset 0 2px 5px rgba(0, 0, 0, 0.65);
+  }
+
+  /* ------------------------------- segmented well + small keys (deck strip) */
+  .deck-strip {
+    display: flex;
+    align-items: stretch;
+    gap: 4px;
+  }
+  .seg {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: flex;
+    gap: 3px;
+    padding: 3px;
+    border-radius: 10px;
+    background: rgba(0, 0, 0, 0.34);
+    box-shadow: inset 0 2px 5px rgba(0, 0, 0, 0.65);
+  }
+  /* The controls a child reaches for most after the platter itself. Condensing
+     them must not take them below a fingertip: 40px floor. */
+  .seg-btn {
+    flex: 1 1 0;
+    min-width: 0;
+    min-height: 40px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 1px;
+    padding: 7px 2px;
+    border-radius: 7px;
+    border: 1px solid transparent;
+    color: #7d8798;
+    font-weight: 900;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    line-height: 1;
+    -webkit-tap-highlight-color: transparent;
+    transition: background 120ms ease, color 120ms ease;
+  }
+  .seg-btn[data-on='true'] {
+    border-color: #46516b;
+    color: #e2e8f0;
+    background-image: linear-gradient(180deg, #333d55, #212837);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12), 0 1px 3px rgba(0, 0, 0, 0.6);
+  }
+  .seg-btn:disabled {
+    opacity: 0.3;
+    filter: grayscale(0.8);
+    pointer-events: none;
+  }
+  .seg-btn:focus-visible {
+    outline: 2px solid #e2e8f0;
+    outline-offset: 1px;
+  }
+  /* Groove selector: one word per segment instead of an icon stack. */
+  .seg-btn--wide {
+    padding: 6px 10px;
+    font-size: 10px;
+    letter-spacing: 0.1em;
+  }
+
+  /* Square icon key: Hook, eject. */
+  .key {
+    flex: 0 0 auto;
+    width: 32px;
+    display: grid;
+    place-items: center;
+    border-radius: 9px;
+    border: 1px solid #333c53;
+    color: #94a3b8;
+    font-size: 14px;
+    background-image: linear-gradient(180deg, #2a3247, #171d2a);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08), 0 2px 0 #0b0f16;
+    -webkit-tap-highlight-color: transparent;
+    transition: transform 90ms ease, box-shadow 90ms ease, color 150ms ease, border-color 150ms ease;
+  }
+  @media (min-width: 640px) {
+    .key {
+      width: 38px;
+      font-size: 16px;
+    }
+  }
+  .key[data-on='true'] {
+    border-color: #a3e635;
+    color: #bef264;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12), 0 2px 0 #0b0f16, 0 0 16px rgba(163, 230, 53, 0.45);
+  }
+  .key:active {
+    transform: translateY(2px);
+    box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.7);
+  }
+  .key:focus-visible {
+    outline: 2px solid #e2e8f0;
+    outline-offset: 2px;
+  }
+  .key:disabled {
+    opacity: 0.3;
+    filter: grayscale(0.8);
+    pointer-events: none;
+  }
+  /* Secondary action (swap the song): present, obviously not the main event. */
+  .key--ghost {
+    border-color: #262e40;
+    background-image: none;
+    background: rgba(0, 0, 0, 0.25);
+    color: #56607a;
+    box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.6);
+  }
+  /* 34px, not 26. This is the ONLY route back to the song picker and it carries
+     no word — a child aiming at a 26px unlabelled glyph beside a rounded corner
+     misses it. Still under WCAG's 44px, which the tile has no room for, but no
+     longer the smallest target on a screen built for seven-year-olds. */
+  .key--sm {
+    width: 34px;
+    height: 34px;
+    font-size: 13px;
+    border-radius: 8px;
+  }
+
+  /* The module's label strip: status LED, what is loaded, and eject. It sits
+     ABOVE the platter for two reasons. It leaves exactly one row of controls
+     under the turntable, which is what "condense" asked for; and it keeps
+     eject out of the platter's grab annulus — a 168px tile on a phone has only
+     12px of clearance beside the record, so a corner button would overlap the
+     circle and turn a scratch that starts high-right into an unload. */
+  .deck-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 7px 8px 0 11px;
+  }
+
+  /* ---------------------------------------------------- sync patch cable */
+  .link-rail {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 0 4px;
+  }
+  .link-wire {
+    flex: 1 1 0;
+    height: 2px;
+    border-radius: 2px;
+    background-image: repeating-linear-gradient(90deg, #2a3244 0 6px, transparent 6px 12px);
+  }
+  /* Locked: the dashes become a solid lit cable running into each deck. */
+  .link-rail[data-on='true'] .link-wire {
+    background-image: none;
+    background: var(--wire);
+    box-shadow: 0 0 10px var(--wire);
+  }
+  .link-rail .link-wire:first-child {
+    --wire: #22d3ee;
+  }
+  .link-rail .link-wire:last-child {
+    --wire: #f472b6;
+  }
+  .link-btn {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    padding: 9px 16px;
+    border-radius: 999px;
+    border: 1px solid #333c53;
+    color: #94a3b8;
+    font-size: 11px;
+    font-weight: 900;
+    text-transform: uppercase;
+    letter-spacing: 0.16em;
+    white-space: nowrap;
+    background-image: linear-gradient(180deg, #2a3247, #171d2a);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08), 0 2px 0 #0b0f16, 0 4px 8px rgba(0, 0, 0, 0.5);
+    -webkit-tap-highlight-color: transparent;
+    transition: transform 90ms ease, box-shadow 120ms ease, color 150ms ease, border-color 150ms ease;
+  }
+  .link-rail[data-on='true'] .link-btn {
+    border-color: #c084fc;
+    color: #e9d5ff;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.14), 0 2px 0 #0b0f16, 0 0 22px rgba(192, 132, 252, 0.5);
+  }
+  .link-btn:active {
+    transform: translateY(2px);
+    box-shadow: inset 0 2px 5px rgba(0, 0, 0, 0.7);
+  }
+  .link-btn:focus-visible {
+    outline: 2px solid #e2e8f0;
+    outline-offset: 2px;
+  }
+  .link-led {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex: 0 0 auto;
+    background: #0e131d;
+    box-shadow: inset 0 1px 1px rgba(0, 0, 0, 0.9), 0 0 0 1px rgba(255, 255, 255, 0.07);
+  }
+  .link-rail[data-on='true'] .link-led {
+    background: #c084fc;
+    box-shadow: 0 0 10px #c084fc;
+  }
+
+  /* ------------------------------------------- platter hint + deck status */
+  /* Sits over the record. pointer-events:none is load-bearing: the platter IS
+     the play button and the grab surface, and this must intercept neither. */
+  .platter-hint {
+    position: absolute;
+    left: 50%;
+    bottom: 6%;
+    transform: translateX(-50%);
+    pointer-events: none;
+    padding: 3px 10px;
+    border-radius: 999px;
+    font-size: 9px;
+    font-weight: 900;
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    white-space: nowrap;
+    color: #cbd5e1;
+    background: rgba(8, 11, 18, 0.78);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.6);
+  }
+  .deck-led {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    flex: 0 0 auto;
+    background: #0e131d;
+    box-shadow: inset 0 1px 1px rgba(0, 0, 0, 0.9), 0 0 0 1px rgba(255, 255, 255, 0.07);
+  }
+
+  /* ---------------------------------------------------------- fader head */
+  .fader-ends {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 3px;
+    margin-bottom: 2px;
+    font-size: 10px;
+    font-weight: 900;
+    text-transform: uppercase;
+    letter-spacing: 0.14em;
+  }
 }
-.kid-slider::-webkit-slider-runnable-track {
-  height: 16px;
-  border-radius: 999px;
-  background: linear-gradient(90deg, rgba(34, 211, 238, 0.35), rgba(244, 114, 182, 0.35));
+
+@media (prefers-reduced-motion: reduce) {
+  .pad,
+  .key,
+  .link-btn,
+  .seg-btn {
+    transition: none;
+  }
 }
-.kid-slider::-moz-range-track {
-  height: 16px;
-  border-radius: 999px;
-  background: linear-gradient(90deg, rgba(34, 211, 238, 0.35), rgba(244, 114, 182, 0.35));
+
+/* ==========================================================================
+   CONSOLE FADER (Party Mode mix)
+
+   Every rule is scoped `input[type='range'].kid-slider::…` (0,2,2) ON PURPOSE.
+   The plain `.kid-slider::-webkit-slider-runnable-track` form is (0,1,1) and
+   LOSES to the global `input[type='range']::-webkit-…` (0,1,2) above — which
+   is why the previous set of .kid-slider rules never rendered a single pixel
+   and the fader looked unstyled. Do not "simplify" these selectors.
+
+   Each engine also gets its own block: a rule whose selector list mixes a
+   -webkit- and a -moz- pseudo-element is discarded whole by BOTH engines.
+   ========================================================================== */
+input[type='range'].kid-slider {
+  height: 52px;
+  cursor: grab;
+  /* pan-y, not none: the fader is a wide strip and a child will try to scroll
+     the page from it. Horizontal drags still belong to the control. */
+  touch-action: pan-y;
 }
-.kid-slider::-webkit-slider-thumb {
-  width: 40px;
-  height: 40px;
-  margin-top: -12px;
-  border-radius: 50%;
-  background: #ffffff;
-  border: 3px solid #0a0d14;
-  box-shadow: 0 0 18px rgba(255, 255, 255, 0.4);
+input[type='range'].kid-slider:active {
+  cursor: grabbing;
 }
-.kid-slider::-moz-range-thumb {
-  width: 40px;
-  height: 40px;
-  border-radius: 50%;
-  background: #ffffff;
-  border: 3px solid #0a0d14;
-  box-shadow: 0 0 18px rgba(255, 255, 255, 0.4);
+
+/* Recessed channel: centre detent, tick marks, and an A/B colour wash, all
+   baked into one background stack so the track stays a single box. */
+input[type='range'].kid-slider::-webkit-slider-runnable-track {
+  height: 18px;
+  border-radius: 5px;
+  border: 0;
+  background-color: #090c12;
+  background-image: linear-gradient(
+      90deg,
+      transparent calc(50% - 1px),
+      rgba(226, 232, 240, 0.6) calc(50% - 1px) calc(50% + 1px),
+      transparent calc(50% + 1px)
+    ),
+    repeating-linear-gradient(90deg, rgba(255, 255, 255, 0.1) 0 1px, transparent 1px 10%),
+    linear-gradient(90deg, rgba(34, 211, 238, 0.3), rgba(20, 26, 38, 0.15) 50%, rgba(244, 114, 182, 0.3));
+  /* An outer ring rather than a border: a border would change the track's
+     content box and de-centre the cap's margin-top maths below. */
+  box-shadow: inset 0 3px 6px rgba(0, 0, 0, 0.95), inset 0 -1px 0 rgba(255, 255, 255, 0.06), 0 0 0 1px #05070b;
+}
+input[type='range'].kid-slider::-moz-range-track {
+  height: 18px;
+  border-radius: 5px;
+  border: 0;
+  background-color: #090c12;
+  background-image: linear-gradient(
+      90deg,
+      transparent calc(50% - 1px),
+      rgba(226, 232, 240, 0.6) calc(50% - 1px) calc(50% + 1px),
+      transparent calc(50% + 1px)
+    ),
+    repeating-linear-gradient(90deg, rgba(255, 255, 255, 0.1) 0 1px, transparent 1px 10%),
+    linear-gradient(90deg, rgba(34, 211, 238, 0.3), rgba(20, 26, 38, 0.15) 50%, rgba(244, 114, 182, 0.3));
+  box-shadow: inset 0 3px 6px rgba(0, 0, 0, 0.95), 0 0 0 1px #05070b;
+}
+
+/* Moulded cap, 42x30, with a hard bright grip line down the middle — baked
+   into the gradient because a pseudo-element cannot carry its own ::before.
+   margin-top = (18 - 30) / 2 = -6px against the track's CONTENT box; the
+   explicit border-box keeps the 1px border inside that 30. */
+input[type='range'].kid-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  box-sizing: border-box;
+  width: 42px;
+  height: 30px;
+  margin-top: -6px;
+  border-radius: 7px;
+  border: 1px solid #05070b;
+  background-image: linear-gradient(
+    180deg,
+    #59647c 0%,
+    #39435a 42%,
+    #0a0d14 46%,
+    rgba(226, 232, 240, 0.78) 50%,
+    #0a0d14 54%,
+    #2b3346 58%,
+    #171d29 100%
+  );
+  box-shadow: 0 2px 5px rgba(0, 0, 0, 0.85), inset 0 1px 0 rgba(255, 255, 255, 0.22),
+    0 0 14px var(--cap-glow, rgba(255, 255, 255, 0.35));
+}
+/* No margin-top here: Firefox centres the thumb on the track itself, and the
+   explicit border kills the UA default. */
+input[type='range'].kid-slider::-moz-range-thumb {
+  box-sizing: border-box;
+  width: 42px;
+  height: 30px;
+  border-radius: 7px;
+  border: 1px solid #05070b;
+  background-image: linear-gradient(
+    180deg,
+    #59647c 0%,
+    #39435a 42%,
+    #0a0d14 46%,
+    rgba(226, 232, 240, 0.78) 50%,
+    #0a0d14 54%,
+    #2b3346 58%,
+    #171d29 100%
+  );
+  box-shadow: 0 2px 5px rgba(0, 0, 0, 0.85), inset 0 1px 0 rgba(255, 255, 255, 0.22),
+    0 0 14px var(--cap-glow, rgba(255, 255, 255, 0.35));
+}
+input[type='range'].kid-slider:focus {
+  outline: none;
+}
+input[type='range'].kid-slider:focus-visible::-webkit-slider-thumb {
+  box-shadow: 0 0 0 3px rgba(226, 232, 240, 0.75), 0 0 14px var(--cap-glow, rgba(255, 255, 255, 0.35));
+}
+input[type='range'].kid-slider:focus-visible::-moz-range-thumb {
+  box-shadow: 0 0 0 3px rgba(226, 232, 240, 0.75), 0 0 14px var(--cap-glow, rgba(255, 255, 255, 0.35));
 }

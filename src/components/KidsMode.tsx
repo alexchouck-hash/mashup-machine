@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import type { CSSProperties } from 'react';
 import { engine } from '../audio/AudioEngine';
 import type { Deck } from '../audio/Deck';
 import { GROOVES, type DrumLayer } from '../audio/BeatMachine';
@@ -19,9 +20,32 @@ import { Turntable } from './Turntable';
  *  - It moves. The visualizer and the beat pulses make it obvious that the
  *    song and the drums are locked together.
  *  - Every assist is forced on. There is no way to make it sound wrong.
+ *
+ * The chrome is hardware, not software: the decks sit on top, joined by a patch
+ * cable, and everything below them is ONE rack chassis — silkscreen legends,
+ * recessed wells, moulded keys with real LEDs, a console fader. That look lives
+ * in index.css (.rack / .pad / .seg / .key / .link-rail / .kid-slider); this
+ * file only says which class and which colour.
+ *
+ * Nothing here animates through React. The visualizer, the beat pulse, the step
+ * dots and the platter each own a rAF loop that reads the engine directly.
  */
 
 const COLORS = ['#22d3ee', '#f472b6'];
+
+const clamp01 = (v: number) => (v < 0 ? 0 : v > 1 ? 1 : v);
+
+/**
+ * Fader cap glow, lerped cyan -> pink with the crossfader's travel. Hex in, hex
+ * out: CSS cannot add an alpha channel to a var() colour, and color-mix() is
+ * too new to bet a tablet on.
+ */
+function mixHex(a: string, b: string, t: number): string {
+  const part = (hex: string, i: number) => parseInt(hex.slice(1 + i * 2, 3 + i * 2), 16);
+  const at = clamp01(t);
+  const chan = (i: number) => Math.round(part(a, i) + (part(b, i) - part(a, i)) * at);
+  return `#${[0, 1, 2].map((i) => chan(i).toString(16).padStart(2, '0')).join('')}`;
+}
 
 /* ------------------------------------------------------------- visualizer */
 
@@ -101,9 +125,33 @@ interface PadProps {
 }
 
 function BigPad({ emoji, label, color, active, disabled, onPress, onRelease }: PadProps) {
+  // Exactly one release per press, whatever swallows the pointerup. A pad that
+  // becomes disabled while held gets pointer-events:none and never sees the up,
+  // which would strand a held effect (Swoosh stuck closed for the rest of the
+  // party). lostpointercapture fires after a normal pointerup too, so the latch
+  // is what keeps that from double-releasing.
+  const held = useRef(false);
+  const release = () => {
+    if (!held.current) return;
+    held.current = false;
+    onRelease?.();
+  };
+
   return (
     <button
       disabled={disabled}
+      data-on={active ? 'true' : 'false'}
+      className="pad"
+      // The one colour the call site passes drives the border, the label, the
+      // wash, the LED and the glow. Custom properties, so a pad added later
+      // inherits the whole hardware look by passing what it already passes.
+      style={
+        {
+          '--pad': color,
+          '--pad-soft': `${color}22`,
+          '--pad-glow': `${color}66`,
+        } as CSSProperties
+      }
       onPointerDown={(e) => {
         // Capture so a finger sliding off still delivers the release. Guarded:
         // an invalid pointer id throws, and that must not swallow the press.
@@ -112,28 +160,29 @@ function BigPad({ emoji, label, color, active, disabled, onPress, onRelease }: P
         } catch {
           /* capture is an optimisation, not a requirement */
         }
+        held.current = true;
         onPress();
       }}
-      onPointerUp={() => onRelease?.()}
-      onPointerCancel={() => onRelease?.()}
-      className="rounded-2xl border-2 font-black uppercase tracking-wide transition-transform
-                 active:scale-95 disabled:opacity-30 disabled:pointer-events-none
-                 flex flex-col items-center justify-center gap-0.5 py-2.5 sm:py-3
-                 select-none touch-none"
-      style={{
-        borderColor: active ? color : '#2a3244',
-        background: active ? `${color}26` : '#161b27',
-        color: active ? color : '#94a3b8',
-        boxShadow: active ? `0 0 22px ${color}55` : 'none',
-      }}
+      onPointerUp={release}
+      onPointerCancel={release}
+      onLostPointerCapture={release}
     >
-      <span className="text-xl sm:text-2xl leading-none">{emoji}</span>
-      <span className="text-[9px] sm:text-[11px] leading-tight">{label}</span>
+      <span className="pad-led" />
+      <span className="pad-emoji">{emoji}</span>
+      <span className="pad-label">{label}</span>
     </button>
   );
 }
 
 /* -------------------------------------------------------------- song tile */
+
+/** Vocal isolation, as three segments of one switch. Icons always; words when
+ *  there is room for them. */
+const VOCAL_MODES = [
+  ['both', '🎵', 'All'],
+  ['music', '🎸', 'No vox'],
+  ['vocals', '🎤', 'Vox'],
+] as const;
 
 function SongTile({ deck, color }: { deck: Deck; color: string }) {
   useEngineVersion();
@@ -186,6 +235,7 @@ function SongTile({ deck, color }: { deck: Deck; color: string }) {
   };
 
   const busy = deck.loading || deck.analyzing || rendering !== null;
+  const hookReady = !!deck.analysis && deck.analysis.hookLengthSec > 0;
 
   return (
     <div
@@ -242,92 +292,98 @@ function SongTile({ deck, color }: { deck: Deck; color: string }) {
         </div>
       ) : (
         <>
-          {/* The platter is the play surface. Turntable swallows the click that
-              ends a grab, so a scratch never also toggles playback. */}
-          <button
-            onClick={() => deck.togglePlay()}
-            className="flex-1 w-full flex flex-col items-center justify-center gap-1 py-2 sm:py-3 px-3 transition"
-          >
-            <Turntable
-              deck={deck}
-              color={color}
-              onScratchStart={(e) => {
-                for (const d of engine.scratchGroup(e.deck)) d.scratchStart();
-              }}
-              onScratchMove={(e) => {
-                for (const d of engine.scratchGroup(e.deck)) {
-                  // The grabbed deck follows the finger's absolute position; a
-                  // linked partner follows only its SPEED, since its own
-                  // playhead is somewhere else entirely in a different track.
-                  if (d === e.deck) d.scratchMove(e.positionSec, e.rate);
-                  else d.scratchRate(e.rate);
-                }
-              }}
-              onScratchEnd={(e) => {
-                for (const d of engine.scratchGroup(e.deck)) {
-                  d.scratchEnd(d === e.deck ? e.wasPlaying : undefined);
-                }
-              }}
-            />
+          {/* Module label strip: lit LED when this deck is playing, what is
+              loaded, and eject. Above the platter so that everything BELOW the
+              turntable is one row of controls, and so eject is nowhere near
+              the grab annulus a scratch starts in. */}
+          <div className="deck-head">
             <span
-              className="font-black uppercase tracking-wide text-[11px] sm:text-xs"
-              style={{ color: deck.playing ? color : '#94a3b8' }}
-            >
-              {deck.playing ? 'Playing — spin me' : 'Tap to play'}
-            </span>
-          </button>
-          <div className="px-2 pb-1.5 grid grid-cols-4 gap-1">
-            {(
-              [
-                ['both', '🎵', 'All'],
-                ['music', '🎸', 'No vox'],
-                ['vocals', '🎤', 'Vox'],
-              ] as const
-            ).map(([m, icon, label]) => (
-              <button
-                key={m}
-                onClick={() => deck.setVocalMode(m)}
-                disabled={m === 'music' && !deck.canRemoveVocals}
-                title={
-                  m === 'music' && !deck.canRemoveVocals
-                    ? 'This track is mono, so there is no centre to cancel'
-                    : undefined
-                }
-                className={`rounded-lg border py-1.5 flex flex-col items-center leading-none gap-0.5 transition
-                            disabled:opacity-30 disabled:pointer-events-none ${
-                              deck.vocalMode === m
-                                ? 'border-slate-100 bg-slate-100 text-slate-900'
-                                : 'border-edge bg-panel2 text-slate-400'
-                            }`}
-              >
-                <span className="text-sm">{icon}</span>
-                <span className="text-[8px] font-black uppercase tracking-wide">{label}</span>
-              </button>
-            ))}
-            <button
-              disabled={!deck.analysis || deck.analysis.hookLengthSec <= 0}
-              onClick={() => deck.playHook()}
-              title="Loop the catchiest repeated bit"
-              className={`rounded-lg border py-1.5 flex flex-col items-center leading-none gap-0.5 transition
-                          disabled:opacity-30 disabled:pointer-events-none ${
-                            deck.loopStartSec != null
-                              ? 'border-lime-400 bg-lime-400/20 text-lime-300'
-                              : 'border-edge bg-panel2 text-slate-400'
-                          }`}
-            >
-              <span className="text-sm">🔁</span>
-              <span className="text-[8px] font-black uppercase tracking-wide">Hook</span>
-            </button>
-          </div>
-          <div className="px-3 pb-2.5 flex items-center gap-2">
-            <span className="truncate text-[11px] text-slate-400 flex-1">
+              className="deck-led"
+              style={deck.playing ? { background: color, boxShadow: `0 0 9px ${color}` } : undefined}
+            />
+            <span className="truncate flex-1 text-[11px] text-slate-400" title={deck.fileName}>
               {busy ? 'Getting ready…' : deck.fileName.replace(/\.[^.]+$/, '')}
             </span>
             <button
               onClick={() => deck.unload()}
-              className="text-[10px] uppercase font-black tracking-wide text-slate-500 hover:text-slate-300 px-1.5 py-1"
+              aria-label="Swap song"
+              title="Swap song"
+              className="key key--ghost key--sm"
             >
-              Swap
+              ⏏
+            </button>
+          </div>
+          {/* The platter is the play surface. Turntable swallows the click that
+              ends a grab, so a scratch never also toggles playback. Everything
+              in here is phrasing content: a <div> inside a <button> is not. */}
+          <button
+            onClick={() => deck.togglePlay()}
+            className="flex-1 w-full flex flex-col items-center justify-center py-1.5 sm:py-2.5 px-3 transition"
+          >
+            <span className="relative block w-full">
+              <Turntable
+                deck={deck}
+                color={color}
+                onScratchStart={(e) => {
+                  for (const d of engine.scratchGroup(e.deck)) d.scratchStart();
+                }}
+                onScratchMove={(e) => {
+                  for (const d of engine.scratchGroup(e.deck)) {
+                    // The grabbed deck follows the finger's absolute position; a
+                    // linked partner follows only its SPEED, since its own
+                    // playhead is somewhere else entirely in a different track.
+                    if (d === e.deck) d.scratchMove(e.positionSec, e.rate);
+                    else d.scratchRate(e.rate);
+                  }
+                }}
+                onScratchEnd={(e) => {
+                  for (const d of engine.scratchGroup(e.deck)) {
+                    d.scratchEnd(d === e.deck ? e.wasPlaying : undefined);
+                  }
+                }}
+              />
+              {/* The instruction a child needs, moved onto the record so it
+                  costs no row. pointer-events:none in CSS — it sits over the
+                  play target and the scratch surface and must catch neither. */}
+              <span className="platter-hint">{deck.playing ? 'Spin me' : 'Tap to play'}</span>
+            </span>
+          </button>
+
+          <div className="deck-strip px-2 pb-2">
+            <div className="seg" role="group" aria-label="Vocals">
+              {VOCAL_MODES.map(([mode, icon, label]) => (
+                <button
+                  key={mode}
+                  onClick={() => deck.setVocalMode(mode)}
+                  disabled={mode === 'music' && !deck.canRemoveVocals}
+                  data-on={deck.vocalMode === mode ? 'true' : 'false'}
+                  aria-pressed={deck.vocalMode === mode}
+                  aria-label={label}
+                  title={
+                    mode === 'music' && !deck.canRemoveVocals
+                      ? 'This track is mono, so there is no centre to cancel'
+                      : label
+                  }
+                  className="seg-btn"
+                >
+                  <span className="text-[13px] sm:text-[15px]">{icon}</span>
+                  <span className="hidden sm:inline text-[8px]">{label}</span>
+                </button>
+              ))}
+            </div>
+            <button
+              disabled={!hookReady}
+              onClick={() => deck.playHook()}
+              data-on={deck.loopStartSec != null ? 'true' : 'false'}
+              aria-pressed={deck.loopStartSec != null}
+              aria-label="Hook"
+              title="Loop the catchiest repeated bit"
+              className="key"
+            >
+              {/* Repeat-ONE, not repeat. Echo's pad is 🔁, and two identical
+                  glyphs meaning different things is unreadable to a child who
+                  cannot read the labels either. */}
+              🔂
             </button>
           </div>
         </>
@@ -389,6 +445,10 @@ export function KidsMode({ onExit }: { onExit: () => void }) {
     }
   };
 
+  // A non-finite crossfade would make this a React-uncontrolled input AND emit
+  // "#NaNNaNNaN" from the lerp below, which kills the whole box-shadow.
+  const mix = Number.isFinite(engine.crossfade) ? clamp01(engine.crossfade) : 0.5;
+
   return (
     <div className="min-h-full flex flex-col gap-2 sm:gap-3 p-2 sm:p-3 max-w-5xl mx-auto">
       <header className="flex items-center gap-2">
@@ -425,144 +485,206 @@ export function KidsMode({ onExit }: { onExit: () => void }) {
         <Visualizer />
       </div>
 
+      {/* Sync lives here, not in a grid of pads: it is the one control that
+          describes BOTH decks, so it is drawn as the cable between them. */}
+      <div className="link-rail" data-on={engine.linkDecks ? 'true' : 'false'}>
+        <span className="link-wire" />
+        <button
+          onClick={() => engine.setLink(!engine.linkDecks)}
+          aria-pressed={engine.linkDecks}
+          title="Lock both songs together — one scratch spins both"
+          className="link-btn"
+        >
+          <span className="link-led" />
+          <span>🔗 Sync</span>
+        </button>
+        <span className="link-wire" />
+      </div>
+
       <div className="grid grid-cols-2 gap-2 sm:gap-3">
         {a && <SongTile deck={a} color={COLORS[0]} />}
         {b && <SongTile deck={b} color={COLORS[1]} />}
       </div>
 
-      {/* mix */}
-      <div className="panel px-3 sm:px-4 py-2.5">
-        <div className="flex items-center justify-between mb-1 text-[11px] font-black uppercase tracking-wide">
-          <span style={{ color: COLORS[0] }}>Song 1</span>
-          <span className="text-slate-500 text-[10px]">Mix</span>
-          <span style={{ color: COLORS[1] }}>Song 2</span>
+      {/* One chassis for the whole lower half. Four floating cards read as
+          software; a single bezel with grooves, legends and screws reads as a
+          soundboard, which is what this is meant to be. */}
+      <section className="rack">
+        {/* ------------------------------------------------------------ mix */}
+        <div className="rack-row">
+          <div className="legend">Mix</div>
+          <div className="fader-ends">
+            <span style={{ color: COLORS[0] }}>Song 1</span>
+            <span style={{ color: COLORS[1] }}>Song 2</span>
+          </div>
+          <input
+            type="range"
+            min={0}
+            max={1}
+            step={0.005}
+            value={mix}
+            onChange={(e) => engine.setCrossfade(parseFloat(e.target.value))}
+            onDoubleClick={() => engine.setCrossfade(0.5)}
+            aria-label="Mix between Song 1 and Song 2"
+            className="kid-slider"
+            style={{ '--cap-glow': `${mixHex(COLORS[0], COLORS[1], mix)}88` } as CSSProperties}
+          />
         </div>
-        <input
-          type="range"
-          min={0}
-          max={1}
-          step={0.005}
-          value={engine.crossfade}
-          onChange={(e) => engine.setCrossfade(parseFloat(e.target.value))}
-          onDoubleClick={() => engine.setCrossfade(0.5)}
-          className="kid-slider"
-        />
-      </div>
 
-      {/* beats */}
-      <div className="panel p-2.5 sm:p-3 space-y-2">
-        <div className="flex items-center gap-2">
-          <span className="lbl">Beats</span>
-          <div className="ml-auto flex gap-1">
-            {GROOVES.map((g, i) => (
-              <button
-                key={g.name}
-                onClick={() => bm.setGroove(i)}
-                className={`px-2 sm:px-2.5 py-1 rounded-lg text-[10px] font-black uppercase tracking-wide border transition ${
-                  bm.grooveIndex === i
-                    ? 'bg-slate-100 text-slate-900 border-slate-100'
-                    : 'border-edge bg-panel2 text-slate-400'
-                }`}
-              >
-                {g.name}
-              </button>
-            ))}
+        {/* ---------------------------------------------------------- beats */}
+        <div className="rack-row">
+          <div className="legend-bar">
+            <span className="legend">Beats</span>
+            <div className="seg" role="group" aria-label="Groove">
+              {GROOVES.map((g, i) => (
+                <button
+                  key={g.name}
+                  onClick={() => bm.setGroove(i)}
+                  data-on={bm.grooveIndex === i ? 'true' : 'false'}
+                  aria-pressed={bm.grooveIndex === i}
+                  className="seg-btn seg-btn--wide"
+                >
+                  {g.name}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="well">
+            {/* 52px keeps all five drum keys on one row on a 360px phone. */}
+            <div className="pad-grid" style={{ '--pad-min': '52px' } as CSSProperties}>
+              {LAYERS.map((l) => (
+                <BigPad
+                  key={l.key}
+                  emoji={l.emoji}
+                  label={l.label}
+                  color="#a3e635"
+                  active={bm.layers[l.key]}
+                  onPress={() => bm.toggleLayer(l.key)}
+                />
+              ))}
+            </div>
           </div>
         </div>
-        <div className="grid grid-cols-5 gap-1.5 sm:gap-2">
-          {LAYERS.map((l) => (
-            <BigPad
-              key={l.key}
-              emoji={l.emoji}
-              label={l.label}
-              color="#a3e635"
-              active={bm.layers[l.key]}
-              onPress={() => bm.toggleLayer(l.key)}
-            />
-          ))}
-        </div>
-      </div>
 
-      {/* fx */}
-      <div className="panel p-2.5 sm:p-3 space-y-2">
-        <span className="lbl">Magic buttons</span>
-        <div className="grid grid-cols-3 sm:grid-cols-6 gap-1.5 sm:gap-2">
-          <BigPad
-            emoji="🌊"
-            label="Swoosh"
-            color="#38bdf8"
-            active={fx.filterOn}
-            onPress={() => fx.setFilter(true)}
-            onRelease={() => fx.setFilter(false)}
-          />
-          <BigPad
-            emoji="🔁"
-            label="Echo"
-            color="#818cf8"
-            active={fx.echoOn}
-            onPress={() => fx.setEcho(true)}
-            onRelease={() => fx.setEcho(false)}
-          />
-          <BigPad
-            emoji="⚡"
-            label="Stutter"
-            color="#facc15"
-            active={fx.stutterOn}
-            onPress={() => fx.setStutter(true)}
-            onRelease={() => fx.setStutter(false)}
-          />
-          <BigPad emoji="📣" label="Horn" color="#fb923c" onPress={() => fx.horn()} />
-          <BigPad emoji="🚀" label="Build" color="#f472b6" onPress={() => fx.build()} />
-          <BigPad emoji="💥" label="Big drop" color="#ef4444" onPress={() => macros.bigDrop()} />
+        {/* ------------------------------------------------------------- fx */}
+        <div className="rack-row">
+          <div className="legend">Magic buttons</div>
+          <div className="well">
+            {/* auto-fit at 84px: three across on a phone, six on a tablet, and
+                a seventh pad added later re-flows instead of breaking a row. */}
+            <div className="pad-grid" style={{ '--pad-min': '84px' } as CSSProperties}>
+              <BigPad
+                emoji="🌊"
+                label="Swoosh"
+                color="#38bdf8"
+                active={fx.filterOn}
+                onPress={() => fx.setFilter(true)}
+                onRelease={() => fx.setFilter(false)}
+              />
+              <BigPad
+                emoji="🔁"
+                label="Echo"
+                color="#818cf8"
+                active={fx.echoOn}
+                onPress={() => fx.setEcho(true)}
+                onRelease={() => fx.setEcho(false)}
+              />
+              <BigPad
+                emoji="⚡"
+                label="Stutter"
+                color="#facc15"
+                active={fx.stutterOn}
+                onPress={() => fx.setStutter(true)}
+                onRelease={() => fx.setStutter(false)}
+              />
+              <BigPad emoji="📣" label="Horn" color="#fb923c" onPress={() => fx.horn()} />
+              {/* macros.build sweeps the SONGS' own filters with an accelerating
+                  roll. fx.build only layered noise over unchanged music, which
+                  is why it read as useless. Not greyed off `busy` — the second
+                  tap is how you cancel it. */}
+              <BigPad
+                emoji="🚀"
+                label="Build"
+                color="#f472b6"
+                active={macros.active === 'build'}
+                onPress={() => macros.build()}
+              />
+            </div>
+          </div>
         </div>
-      </div>
 
-      {/* auto-mix and the link toggle */}
-      <div className="panel p-2.5 sm:p-3 space-y-2">
-        <div className="flex items-baseline justify-between">
-          <span className="lbl">Do it for me</span>
-          {macros.lastNote && (
-            <span className="text-[10px] text-slate-400 truncate ml-2">{macros.lastNote}</span>
-          )}
+        {/* ----------------------------------------------------------- drops */}
+        <div className="rack-row">
+          <div className="legend">Drops</div>
+          <div className="well">
+            <div className="pad-grid" style={{ '--pad-min': '84px' } as CSSProperties}>
+              <BigPad
+                emoji="💥"
+                label="Drop"
+                color="#ef4444"
+                disabled={macros.busy}
+                onPress={() => macros.drop('classic')}
+              />
+              <BigPad
+                emoji="🛑"
+                label="Tape stop"
+                color="#fb7185"
+                disabled={macros.busy}
+                onPress={() => macros.drop('tapestop')}
+              />
+              <BigPad
+                emoji="⏪"
+                label="Rewind"
+                color="#a78bfa"
+                disabled={macros.busy}
+                onPress={() => macros.drop('reverse')}
+              />
+            </div>
+          </div>
         </div>
-        <div className="grid grid-cols-3 sm:grid-cols-5 gap-1.5 sm:gap-2">
-          <BigPad
-            emoji="🎤"
-            label="1 over 2"
-            color="#22d3ee"
-            active={macros.mixActive === 'AB'}
-            onPress={() => macros.autoMixAOverB()}
-          />
-          <BigPad
-            emoji="🎤"
-            label="2 over 1"
-            color="#f472b6"
-            active={macros.mixActive === 'BA'}
-            onPress={() => macros.autoMixBOverA()}
-          />
-          <BigPad
-            emoji="🥁"
-            label="Bridge"
-            color="#a3e635"
-            disabled={macros.busy}
-            onPress={() => macros.bridge()}
-          />
-          <BigPad
-            emoji="🔊"
-            label="Bump"
-            color="#facc15"
-            active={macros.bumpOn}
-            onPress={() => macros.toggleBump()}
-          />
-          <BigPad
-            emoji="🔗"
-            label="Sync"
-            color="#c084fc"
-            active={engine.linkDecks}
-            onPress={() => engine.setLink(!engine.linkDecks)}
-          />
+
+        {/* ---------------------------------------------------------- macros */}
+        <div className="rack-row">
+          <div className="legend-bar">
+            <span className="legend">Do it for me</span>
+            {macros.lastNote && <span className="note-readout">{macros.lastNote}</span>}
+          </div>
+          <div className="well">
+            {/* 68px: four across even on a phone, and they stretch to fill on a
+                tablet because auto-fit collapses the tracks nobody used. */}
+            <div className="pad-grid" style={{ '--pad-min': '68px' } as CSSProperties}>
+              <BigPad
+                emoji="🎤"
+                label="1 over 2"
+                color="#22d3ee"
+                active={macros.mixActive === 'AB'}
+                onPress={() => macros.autoMixAOverB()}
+              />
+              <BigPad
+                emoji="🎤"
+                label="2 over 1"
+                color="#f472b6"
+                active={macros.mixActive === 'BA'}
+                onPress={() => macros.autoMixBOverA()}
+              />
+              <BigPad
+                emoji="🥁"
+                label="Bridge"
+                color="#a3e635"
+                disabled={macros.busy}
+                onPress={() => macros.bridge()}
+              />
+              <BigPad
+                emoji="🔊"
+                label="Bump"
+                color="#facc15"
+                active={macros.bumpOn}
+                onPress={() => macros.toggleBump()}
+              />
+            </div>
+          </div>
         </div>
-      </div>
+      </section>
     </div>
   );
 }

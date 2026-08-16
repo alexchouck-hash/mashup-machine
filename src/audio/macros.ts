@@ -2,7 +2,7 @@ import type { AudioEngine } from './AudioEngine';
 import type { Deck } from './Deck';
 import type { DrumLayer } from './BeatMachine';
 import type { VocalMode } from './types';
-import { noiseBuffer, snare } from './drums';
+import { metalBuffer, noiseBuffer, snare } from './drums';
 
 /**
  * Performance macros — the moves that take a whole phrase to land.
@@ -32,9 +32,40 @@ import { noiseBuffer, snare } from './drums';
  * have been, so a drop reveals the song mid-phrase instead of rewinding it, and
  * no worklet resetStretch discontinuity is incurred.
  *
+ * ── WHAT THE BUILD AND THE DROPS DO TO THE MUSIC ──────────────────────────
+ * The owner's complaint was that the build was "useless" and the drop was not
+ * cool enough, and both had the same cause: they were LAYERS OVER unchanged
+ * music. A riser on top of a track that never changes is a sound effect, not
+ * tension. So everything here now acts on the tracks themselves:
+ *
+ *   build   — the decks' own high-pass climbs until the low end has evaporated
+ *             (Deck.setFilter), a snare roll doubles every bar, a noise riser
+ *             and a reverse-cymbal swell come up under it, and the last two
+ *             beats push the decks 1.5% faster. All of it lands on a downbeat.
+ *   classic — the build, then the master gate cuts to a hole and the mix slams
+ *             back louder. The decks additionally duck and filter on the way in,
+ *             so the hole is something the MUSIC fell into.
+ *   tapestop— the records physically wind down to a halt, pitch falling with
+ *             speed, then slam back at full speed.
+ *   reverse — the records are pulled BACKWARDS into the downbeat, accelerating,
+ *             then slam forward.
+ *
+ * THE LAST TWO REUSE THE SCRATCH ENGINE. stretch-processor.js is a general
+ * signed-rate player: a tape stop is `velocity -> 0`, a suck-back is
+ * `velocity -> negative`. There is no second engine here, only an envelope
+ * posted at 50 Hz into the one that already exists. What we do own is the
+ * bookkeeping the platter cannot do for itself — a stranded platter is a deck
+ * that reads as playing and makes no sound, so every grab is released by a
+ * scheduled timer, by a redundant safety timer 1 s later, and by cancel().
+ *
  * REQUIRES engine wiring (see AudioEngine): xfA/xfB -> deckDuck -> deckBus ->
  * sumBus, fxGate/delay -> macroGain -> masterGain, and beatMachine.output ->
  * drumLow -> drumDrive -> drumTrim -> sumBus.
+ *
+ * OPTIONAL engine wiring, detected at runtime: deckLow -> deckPre -> deckDrive
+ * ahead of deckDuck gives bump boost a low shelf and a saturator on the SONGS as
+ * well as the drums. Absent, bump still lifts and pumps the deck path through
+ * deckDuck alone — see `setBump`.
  */
 
 /** Exponential ramps cannot reach zero; ramp to this instead. */
@@ -52,6 +83,71 @@ const CUT_TAIL = 0.006;
 const SLAM_FADE = 0.01;
 /** Level the mix "inhales" to over the bar before the cut. */
 const INHALE = 0.88;
+/** How far the SONGS recede under the roll before the classic cut. -2.8 dB. */
+const DROP_DECK_DIP = 0.72;
+
+/* ---------------------------------------------------------------- build */
+const BUILD_BARS = 4;
+/**
+ * Top of the deck high-pass sweep as a `Deck.setFilter` knob position.
+ * setFilter maps the knob exponentially over 20 Hz - 4 kHz, so 0.86 is
+ * 20 * 200^0.86 = 1.9 kHz: the low end is gone and the track is still there.
+ * A full 1.0 (4 kHz) leaves a telephone, which reads as broken rather than tense.
+ */
+const BUILD_HP_TOP = 0.86;
+/** Tension accelerates. u^1.6 puts two thirds of the sweep in the last bar. */
+const BUILD_HP_SHAPE = 1.6;
+/**
+ * Sweep tick. Deck.setFilter glides each write with a 10 ms setTargetAtTime, so
+ * 50 ms steps merge into a continuous sweep (each step is a 3.4% frequency move
+ * over a 4-bar build, well under the 10 ms glide). It is also a fifth of the
+ * React churn a 60 Hz sweep would cost — setFilter notifies, and Deck.scratchMove
+ * documents why per-frame notifies are the thing to avoid here.
+ */
+const SWEEP_TICK_MS = 50;
+/** Accelerando into the landing. 1.5% is under a quarter semitone of tempo. */
+const BUILD_TEMPO_PCT = 1.5;
+/** Fraction of the build over which that accelerando happens. */
+const RISE_FROM = 0.82;
+/** Snare-roll level at the start and the end. fill() runs 0.18 - 0.53 into the
+ *  same bus with the same voice, so this is the range already proven safe. */
+const ROLL_GAIN_LO = 0.16;
+const ROLL_GAIN_HI = 0.46;
+/** Extra trim on the 1/32 bar, where ~5 snare tails overlap (see `rollBar`). */
+const ROLL_DENSE_TRIM = 0.85;
+/** Hits per beat, bar by bar: 1/4 -> 1/8 -> 1/16 -> 1/32. */
+const ROLL_DIVISIONS = [1, 2, 4, 8];
+/** Peak of the reverse swell's noise bed and of its cymbal layer. */
+const SWELL_NOISE_PEAK = 0.16;
+const SWELL_METAL_PEAK = 0.12;
+/** Hands win: how far a knob may drift from what we wrote before we let go. */
+const HAND_EPS_FILTER = 0.02;
+const HAND_EPS_TEMPO = 0.05;
+
+/* ----------------------------------------------- tape stop / suck-back */
+/** Beats the records take to wind down, and to be pulled back. */
+const STOP_BEATS = 2;
+const REV_BEATS = 2;
+/** v = rate * (1-u)^1.6. The worklet's own gate closes under |v| = 0.02, which
+ *  this curve reaches at u = 0.913 — the record is silent for the last 9% of the
+ *  wind-down, so the downbeat arrives on real silence rather than on a drone. */
+const STOP_SHAPE = 1.6;
+/** v = rate * (1 - 2.4 * u^0.8): forward, through zero at u = 0.333, then
+ *  accelerating backwards to -1.4x. Speed rising IS the pitch rising. */
+const REV_DEPTH = 2.4;
+const REV_SHAPE = 0.8;
+/** Velocity tick. The worklet smooths velTarget with a 12 ms one-pole while a
+ *  "finger" is down, so 20 ms steps arrive already-smoothed and never zipper. */
+const SCRATCH_TICK_MS = 20;
+/** Spin-up lead. vel is that same 12 ms one-pole: 45 ms is 97.6% of full speed. */
+const SPIN_LEAD = 0.045;
+/** Track seconds a platter covers during it, R*[T - tau*(1-e^-T/tau)] / R. The
+ *  catch-up seek subtracts this so the record arrives at the RIGHT BAR. */
+const SPIN_ADVANCE = 0.0333;
+/** Hand the platter back to WSOLA once it is up to speed, not before. */
+const SPIN_TAIL = 0.06;
+/** A suck-back needs somewhere to go; the head of a track is a wall. */
+const REV_MIN_POS = 2;
 
 /* --------------------------------------------------------------- bridge */
 const BRIDGE_BARS = 4;
@@ -72,14 +168,78 @@ const MIN_HOOK_SEC = 1;
 const BUMP_SHELF_DB = 5;
 /** -6 dB, paying back the drive's +7 dB of small-signal gain. */
 const BUMP_TRIM = 0.5;
-/** Sidechain floor 0.65, i.e. -3.7 dB under each kick. */
-const BUMP_DEPTH = 0.35;
 const DUCK_IN = 0.012;
-/** tanh knee. */
+/** tanh knee, shared by the drum and the deck shaper. */
 const DRIVE_K = 2.2;
 const DRIVE_POINTS = 1024;
 /** Trim fade around the curve swap — an instant transfer-function change steps. */
 const SWAP_FADE = 0.008;
+/**
+ * BUMP ON THE TRACKS — the headroom maths, derived the way drums.ts derives its.
+ *
+ * The budget is exact and small: masterGain is MASTER_HEADROOM 0.5 and the
+ * limiter threshold is -3 dBFS (0.708), so a deck peaking at full scale arrives
+ * at 0.5 — 3.0 dB under the limiter. That 3.0 dB is the entire allowance, and
+ * spending more of it means the master limiter starts ducking the songs on every
+ * kick, which is the exact failure drums.ts's LEVELS block exists to prevent.
+ *
+ * Chain, when AudioEngine provides it: deckLow -> deckPre -> deckDrive -> deckDuck.
+ *   deckLow   +4.0 dB lowshelf at 80 Hz. An RBJ lowshelf with S = 1 is monotone,
+ *             so its steady-state magnitude never exceeds the shelf gain: worst
+ *             case peak factor 1.585, on bass-dominated material.
+ *   deckPre   0.5 (-6.0 dB). Pays back the shelf's 4 dB and keeps 2 dB spare for
+ *             a transient, whose peak gain through a filter exceeds the
+ *             steady-state bound. Worst case into the shaper: 1.0 x 1.585 x 0.5
+ *             = 0.792 steady, 0.951 with a 1.2x transient overshoot — under 1.0,
+ *             which is the number that matters, because Web Audio CLAMPS a
+ *             WaveShaper input past +-1 and that is the only hard edge here.
+ *   deckDrive the same normalised tanh (k = 2.2) the drums use. y(+-1) = +-1, so
+ *             THE PEAK CANNOT RISE; it only fills in underneath. Small-signal
+ *             +7.06 dB, which is what pays the -6 dB pre back at listening level.
+ *   deckDuck  base 1.25 (+1.94 dB makeup), sidechained to 0.66 on each kick —
+ *             a 5.55 dB pump, against 3.61 dB below unbumped unity.
+ *
+ * It sits AFTER the shaper deliberately: ducking into a saturator would make the
+ * saturator fight the duck and flatten the pump, which is the whole effect.
+ *
+ * Net at the limiter, worst case: 1.0 x 1.585 x 0.5 -> 0.792 -> shaper 0.964 ->
+ * x1.25 = 1.205 -> x0.5 master = 0.603 against 0.708. **1.40 dB of margin**, and
+ * 1.13 dB on the 1.2x transient case (0.621). On the kick itself it is 7.0 dB.
+ * At listening level (0.3) the low band comes out +6.23 dB and the mids +2.67 dB.
+ *
+ * WITHOUT those nodes only deckDuck exists, so bump gives the songs the makeup
+ * and the pump and nothing else: peak 1.0 x 1.25 x 0.5 = 0.625, 1.08 dB under
+ * the limiter. Both paths are safe on the same arithmetic, which is why the same
+ * two constants serve both.
+ *
+ * KNOWN EDGE: auto-gain may add up to +12 dB, so a quiet, dynamic track can leave
+ * the deck above full scale. It is already over the limiter there; with bump on
+ * it additionally saturates into the shaper's flat region — d/dx of the
+ * normalised tanh at x = 1 is k(1 - tanh²k)/tanh k = 0.108, a twentieth of its
+ * small-signal 2.255, so it is graceful compression rather than a hard corner.
+ * That is drive doing its job on a signal that was already too hot, not a new
+ * failure.
+ */
+const DECK_SHELF_DB = 4;
+const DECK_SHELF_HZ = 80;
+const DECK_PRE = 0.5;
+/** Top of the sidechain, i.e. the songs between kicks. +1.9 dB. */
+const BUMP_BASE = 1.25;
+/** Bottom of it. -5.6 dB under the base, -3.6 dB under unbumped unity. */
+const BUMP_FLOOR = 0.66;
+/**
+ * The deck shaper's curve swap dips the songs instead of muting them. The drums
+ * can be muted for 10 ms because they are percussive; sustained music cannot,
+ * so it ducks 20 dB instead.
+ *
+ * What is left is a transfer-function step of the shaper's small-signal gain,
+ * +7.06 dB, landing on a signal already 20 dB down — so the artifact itself sits
+ * ~13 dB under nominal, and the drums are stepping at that same instant to mask
+ * it. Either side of the dip the change is far smaller: DECK_PRE (-6.02 dB)
+ * against that +7.06 dB is a net 1.04 dB, which is the whole reason the pre-trim
+ * is there.
+ */
+const SWAP_DIP = 0.1;
 
 const NOT_WIRED = 'Audio engine is not wired for macros yet';
 const STILL_GOING = 'Hold on — that one is still going';
@@ -97,8 +257,25 @@ const clamp = (v: number, lo: number, hi: number) => (v < lo ? lo : v > hi ? hi 
  */
 const fin = (v: number | undefined, fb: number): number => (Number.isFinite(v) ? (v as number) : fb);
 
-export type MacroName = 'drop' | 'mixAB' | 'mixBA' | 'bridge';
+export type MacroName = 'drop' | 'build' | 'mixAB' | 'mixBA' | 'bridge';
 type MixName = 'mixAB' | 'mixBA';
+
+/** The three drops. `bigDrop()` is kept as an alias for 'classic'. */
+export type DropKind = 'classic' | 'tapestop' | 'reverse';
+
+export interface DropOptions {
+  riseBars?: number;
+  silenceBeats?: number;
+  liftDb?: number;
+  /** Beats the records spend winding down or being pulled back. */
+  grabBeats?: number;
+}
+
+const DROP_NOTE: Record<DropKind, string> = {
+  classic: 'Here it comes…',
+  tapestop: 'Winding the records down…',
+  reverse: 'Sucking it backwards…',
+};
 
 /** What the tap did, in words a seven-year-old can read. No numbers, per KidsMode. */
 export interface MacroResult {
@@ -126,6 +303,36 @@ interface MixSnapshot {
   layers: DrumLayer[];
 }
 
+/**
+ * A deck under a build. `wrote` is what WE last set; if the live value has moved
+ * away from it, a hand is on the control and restore leaves it alone.
+ */
+interface TensionSnapshot {
+  deck: Deck;
+  filterKnob: number;
+  tempoPercent: number;
+  wroteFilter: number;
+  wroteTempo: number;
+}
+
+/** A platter this macro is holding, and the clock it was grabbed against. */
+interface HeldDeck {
+  deck: Deck;
+  /** Playhead at the grab, and the ctx time of that reading. Together they are a
+   *  virtual playhead the stalled record can be caught back up to. */
+  posAtGrab: number;
+  grabAt: number;
+  /** The deck's own playback rate — "full speed" for this record. */
+  rate: number;
+}
+
+/** The optional deck-path shaper. See the headroom block above. */
+interface DeckShaper {
+  deckLow: BiquadFilterNode;
+  deckPre: GainNode;
+  deckDrive: WaveShaperNode;
+}
+
 function snapshotDeck(deck: Deck): DeckSnapshot {
   return {
     vocalMode: deck.vocalMode,
@@ -140,6 +347,8 @@ function snapshotDeck(deck: Deck): DeckSnapshot {
 export class Macros {
   /** The macro currently scheduled or latched, for lighting a button. */
   active: MacroName | null = null;
+  /** Which drop is landing, so three pads can light independently. */
+  dropKind: DropKind | null = null;
   bumpOn = false;
   /** Plain-language result of the last tap, for a toast or a caption. */
   lastNote = '';
@@ -154,7 +363,16 @@ export class Macros {
   private snap: MixSnapshot | null = null;
 
   private timers = new Set<number>();
+  /**
+   * Build timers live apart from `timers` so a drop can end the BUILD's
+   * scheduled work (it replaces it) without cancelling the drop it is part of.
+   */
+  private tensionTimers = new Set<number>();
+  /** The one armed silence-check per param. See `watchdog` for why only one. */
+  private watchdogs = new Map<AudioParam, number>();
   private easeTimer: number | null = null;
+  private sweepTimer: number | null = null;
+  private scratchTimer: number | null = null;
   /** Bump's curve-swap timer is deliberately OUTSIDE `timers`: cancel() clearing
    *  it would strand the drum trim at FLOOR, i.e. silent drums, forever. */
   private bumpTimer: number | null = null;
@@ -163,6 +381,8 @@ export class Macros {
   private busyUntil = 0;
   /** Last crossfade value the ease itself set — anything else means a hand. */
   private expected = 0;
+  private tensed: TensionSnapshot[] = [];
+  private held: HeldDeck[] = [];
   /** Typed off WaveShaperNode so the Float32Array generic is not pinned here. */
   private driveCurve: WaveShaperNode['curve'] = null;
   private warned = false;
@@ -188,21 +408,98 @@ export class Macros {
     return null;
   }
 
-  /* ------------------------------------------------------------ big drop */
+  /* ---------------------------------------------------------------- build */
 
   /**
-   * Tension into the next downbeat, a hole where the music was, then everything
-   * back at once and slightly louder. The silence is what sells it — a half-beat
-   * gate blink (what Fx.drop does) reads as a glitch, a whole musical bar of
-   * nothing reads as the floor dropping out.
+   * A real build: the MUSIC does the work.
+   *
+   * Four things climb together and all of them land on the same downbeat — the
+   * decks' high-pass (so the low end evaporates), a snare roll that doubles
+   * every bar (1/4, 1/8, 1/16, 1/32), a noise riser with a reverse-cymbal swell
+   * under it, and a 1.5% tempo push over the last stretch. Then it RESOLVES:
+   * the filters snap open on the downbeat and the mix lifts. A build that just
+   * stops is the "useless" one this replaces.
+   *
+   * A second tap cancels it — a child who changes their mind should not have to
+   * wait four bars.
    */
-  bigDrop(opts: { riseBars?: number; silenceBeats?: number; liftDb?: number } = {}): MacroResult {
+  build(opts: { bars?: number; rise?: boolean } = {}): MacroResult {
     if (!this.wired()) return this.fail(NOT_WIRED);
+    if (this.active === 'build') {
+      this.endTension();
+      // endTension only owns the decks. The landing lift is already on the
+      // macroGain timeline and would fire into a build that no longer exists.
+      const g = this.engine.macroGain.gain;
+      const t = this.ctx.currentTime + 0.005;
+      this.holdAt(g, t);
+      g.linearRampToValueAtTime(1, t + 0.05);
+      return this.ok('Never mind');
+    }
     if (this.busy) return this.fail(STILL_GOING);
 
-    const riseBars = clamp(Math.round(fin(opts.riseBars, DROP_RISE_BARS)), 1, 8);
-    const silenceBeats = clamp(Math.round(fin(opts.silenceBeats, DROP_SILENCE_BEATS)), 1, 8);
-    const lift = Math.pow(10, clamp(fin(opts.liftDb, DROP_LIFT_DB), 0, 4) / 20);
+    const bars = clamp(Math.round(fin(opts.bars, BUILD_BARS)), 1, 8);
+    this.engine.ensureBeatClock();
+
+    const bar = this.barSec();
+    const now = this.ctx.currentTime + 0.02;
+    const land = this.downbeatAtLeast(bars * bar);
+    const lift = Math.pow(10, DROP_LIFT_DB / 20);
+
+    this.tension(now, land, bars, {
+      sweepUntil: land,
+      roll: true,
+      cymbal: true,
+      rise: opts.rise !== false,
+    });
+
+    // The landing. Anchored the same way bigDrop anchors its cut: a bare
+    // linearRamp with no preceding event ramps from wherever the param happens
+    // to be when automation starts, which is not a value we control.
+    const mg = this.engine.macroGain.gain;
+    this.watchdog(mg, land + 2 * bar + 0.4);
+    this.holdAt(mg, now);
+    mg.linearRampToValueAtTime(1, now + 0.02);
+    mg.setValueAtTime(1, Math.max(now + 0.03, land - 0.004));
+    this.slam(land, lift, null);
+
+    this.active = 'build';
+    this.busyUntil = land + 0.05;
+    this.afterIn(this.tensionTimers, land - this.ctx.currentTime + 0.02, () => this.endTension());
+    return this.ok('Building it up…');
+  }
+
+  /* ----------------------------------------------------------- the drops */
+
+  /**
+   * Three drops, one door. Each one manipulates the tracks that are playing;
+   * none of them is only a gate on the master.
+   *
+   *  classic  — build, hole, slam. The decks duck and high-pass into the cut so
+   *             the hole is something the music fell into, not a mute over it.
+   *  tapestop — the records wind down to a halt over half a bar, pitch falling
+   *             with speed, a beat of nothing, then back at full speed.
+   *  reverse  — the records are pulled backwards into the downbeat, accelerating
+   *             (so the pitch rises), under a reverse-cymbal swell.
+   *
+   * The last two need a loaded, playing, un-held deck. With none available they
+   * fall back to classic and say so, because a pad that does nothing is the
+   * worst outcome available to this file.
+   */
+  drop(kind: DropKind = 'classic', opts: DropOptions = {}): MacroResult {
+    if (!this.wired()) return this.fail(NOT_WIRED);
+    // A drop ON a running build is the move the build exists for, so it replaces
+    // the build instead of being refused by it.
+    if (this.active === 'build') this.endTension();
+    if (this.busy) return this.fail(STILL_GOING);
+
+    let k: DropKind = kind === 'tapestop' || kind === 'reverse' ? kind : 'classic';
+    let victims = k === 'classic' ? [] : this.grabbable(k);
+    let note = DROP_NOTE[k];
+    if (k !== 'classic' && !victims.length) {
+      k = 'classic';
+      victims = [];
+      note = 'Nothing playing to grab — here is a big one instead';
+    }
 
     // A grid to land on even with every drum layer off. Side effect worth
     // knowing: this starts the transport, so the KidsMode step dots wake up.
@@ -211,8 +508,27 @@ export class Macros {
     const beat = this.beatSec();
     const bar = this.barSec();
     const now = this.ctx.currentTime + 0.02;
+    // The wind-down and the suck-back ARE the tension, so they need less runway.
+    const riseBars = clamp(
+      Math.round(fin(opts.riseBars, k === 'classic' ? DROP_RISE_BARS : 1)),
+      1,
+      8
+    );
+    const silenceBeats = clamp(
+      Math.round(fin(opts.silenceBeats, k === 'classic' ? DROP_SILENCE_BEATS : 1)),
+      1,
+      8
+    );
+    const grabBeats = clamp(
+      Math.round(fin(opts.grabBeats, k === 'reverse' ? REV_BEATS : STOP_BEATS)),
+      1,
+      8
+    );
+    const lift = Math.pow(10, clamp(fin(opts.liftDb, DROP_LIFT_DB), 0, 4) / 20);
+
     const cut = this.downbeatAtLeast(riseBars * bar);
     const back = cut + silenceBeats * beat;
+    const grabAt = Math.max(now + 0.05, cut - grabBeats * beat);
 
     // The analyser sits downstream of this gate, so the visualizer bars collapse
     // through the silence and slam back with the music. Free confirmation.
@@ -228,19 +544,371 @@ export class Macros {
     g.setValueAtTime(0, back - 0.004);
     this.slam(back, lift, null);
 
+    // Classic gets the deck dip; the other two have the platter itself receding,
+    // and ducking a record that is already winding down just hides the effect.
+    if (k === 'classic') this.deckDip(now, cut, back);
+
     // The lead time IS the ramp-in: a tap makes a sound immediately, so waiting
     // for a musical landing point never feels like a dead button.
-    this.riser(now, cut);
-    if (riseBars >= 2) this.fill(cut - 2 * beat, cut);
+    const sweepUntil = k === 'classic' ? cut : grabAt;
+    this.tension(now, cut, riseBars, {
+      sweepUntil,
+      roll: true,
+      cymbal: k !== 'classic',
+      rise: k === 'classic',
+    });
+    this.afterIn(this.tensionTimers, sweepUntil - this.ctx.currentTime + 0.01, () =>
+      this.endSweep()
+    );
     this.downlifter(cut);
 
+    if (k !== 'classic' && victims.length) {
+      this.afterIn(this.timers, grabAt - this.ctx.currentTime, () =>
+        this.grab(victims, k, grabAt, cut)
+      );
+      this.afterIn(this.timers, back - SPIN_LEAD - this.ctx.currentTime, () => this.spinUp());
+      this.afterIn(this.timers, back + SPIN_TAIL - this.ctx.currentTime, () => this.release());
+      // Belt and braces. A platter left held is a deck that reads as playing and
+      // makes no sound at all, and nothing else in the app would ever free it.
+      this.afterIn(this.timers, back + 1 - this.ctx.currentTime, () => this.release());
+    }
+
     this.active = 'drop';
-    this.busyUntil = back + 0.05;
+    this.dropKind = k;
+    // Stay busy past the safety release, so a second tap cannot push a deck onto
+    // `held` that the first drop's release timer is about to let go of.
+    this.busyUntil = back + (k === 'classic' ? 0.05 : 1.05);
     this.after(back - this.ctx.currentTime + 0.06, () => {
       this.active = this.latch;
+      this.dropKind = null;
       this.engine.notify();
     });
-    return this.ok('Here it comes…');
+    return this.ok(note);
+  }
+
+  /** The old name. Kept so every existing caller and key binding still works. */
+  bigDrop(opts: DropOptions = {}): MacroResult {
+    return this.drop('classic', opts);
+  }
+
+  /** Loaded, playing, and not already under somebody's finger. */
+  private grabbable(kind: DropKind): Deck[] {
+    return this.engine.decks.filter((d) => {
+      if (!d.loaded || !d.playing || d.scratching) return false;
+      // A suck-back needs somewhere to go. Near the head of a track the platter
+      // would pin at frame 0 and gate itself silent, which is not an effect.
+      if (kind === 'reverse' && !d.loop && d.positionSecNow < REV_MIN_POS) return false;
+      return true;
+    });
+  }
+
+  /** The songs recede under the roll, then come back with the slam. */
+  private deckDip(now: number, cut: number, back: number): void {
+    const bar = this.barSec();
+    const db = this.engine.deckBus.gain;
+    this.watchdog(db, back + 0.4);
+    this.holdAt(db, now);
+    db.linearRampToValueAtTime(1, now + 0.02);
+    db.setValueAtTime(1, Math.max(now + 0.03, cut - bar));
+    db.linearRampToValueAtTime(DROP_DECK_DIP, cut - CUT_LEAD);
+    db.setValueAtTime(DROP_DECK_DIP, back - 0.004);
+    db.linearRampToValueAtTime(1, back + SLAM_FADE);
+  }
+
+  /* ---------------------------------------------------- the tension parts */
+
+  /**
+   * Everything that climbs. `tHit` is where the roll and the riser land;
+   * `sweepUntil` is where the deck filters stop climbing, which for a tape stop
+   * is EARLIER — a record winding down should do it with its bass intact.
+   */
+  private tension(
+    t0: number,
+    tHit: number,
+    bars: number,
+    opts: { sweepUntil: number; roll: boolean; cymbal: boolean; rise: boolean }
+  ): void {
+    this.riser(t0, tHit);
+    if (opts.cymbal) this.reverseSwell(t0, tHit);
+    if (opts.roll) this.rollIn(tHit - bars * this.barSec(), tHit, bars);
+    this.startSweep(t0, opts.sweepUntil, opts.rise);
+  }
+
+  /**
+   * The accelerating snare roll — the part of a build a listener actually counts.
+   * Each bar doubles: 1/4, 1/8, 1/16, 1/32 into the hit.
+   *
+   * Scheduled a bar at a time rather than all at once. Four bars is ~60 hits and
+   * each snare() builds ~10 nodes, so building them together is a 600-node
+   * main-thread spike at exactly the moment the mix has thinned out and any
+   * glitch is naked.
+   */
+  private rollIn(t0: number, t1: number, bars: number): void {
+    const bar = this.barSec();
+    const beat = this.beatSec();
+    if (bar < 0.4 || t1 - t0 < 0.2) return;
+    // Where the ladder ENDS. 1/32 is only earned by a roll long enough to have
+    // climbed to it — at 174 bpm it is a hit every 43 ms, 23 a second, which
+    // over a single bar is not an accelerating roll, it is a machine gun.
+    const top = ROLL_DIVISIONS.length - (bars >= 3 ? 1 : 2);
+    for (let i = 0; i < bars; i++) {
+      const barAt = t0 + i * bar;
+      const idx = clamp(top - (bars - 1 - i), 0, ROLL_DIVISIONS.length - 1);
+      const div = ROLL_DIVISIONS[idx];
+      this.afterIn(this.tensionTimers, barAt - bar - this.ctx.currentTime, () =>
+        this.rollBar(barAt, div, beat, t0, t1)
+      );
+    }
+  }
+
+  private rollBar(barAt: number, div: number, beat: number, t0: number, t1: number): void {
+    const step = beat / div;
+    if (!(step > 0.005)) return;
+    const span = t1 - t0;
+    for (let j = 0; j < 4 * div; j++) {
+      const at = barAt + j * step;
+      // A bar that was scheduled and then partly overtaken still plays the rest
+      // of itself; hits already in the past are simply skipped.
+      if (at < this.ctx.currentTime + 0.005 || at >= t1) continue;
+      const u = span > 0 ? clamp((at - t0) / span, 0, 1) : 1;
+      // Level climbs (a roll crescendos) while density buys a trim on the
+      // busiest bar: snare's tail is 0.2 s at full accent, so at 174 bpm the
+      // 43 ms 1/32 spacing leaves ~5 of them sounding at once (~6 at the 220 bpm
+      // ceiling `bpm()` clamps to).
+      const gain =
+        (ROLL_GAIN_LO + (ROLL_GAIN_HI - ROLL_GAIN_LO) * u) * (div >= 8 ? ROLL_DENSE_TRIM : 1);
+      // Accent is velocity: quiet hits are also shorter and duller, which is
+      // what stops the dense bars turning into one continuous hiss.
+      snare(this.ctx, this.engine.oneShotBus, at, gain, 0.5 + 0.5 * u);
+    }
+  }
+
+  /**
+   * Reverse cymbal — a swell that arrives rather than decays.
+   *
+   * Two layers because one cannot be both. A looped noise bed under a lowpass
+   * climbing 700 Hz -> 13 kHz gives the length; a single unlooped pass of
+   * drums.ts's metal buffer, playbackRate rising, gives the CYMBAL. The metal
+   * buffer is deliberately not looped: six inharmonic squares splice with a step
+   * edge, and 1.15 s is all of it that is audible anyway.
+   */
+  private reverseSwell(t0: number, t1: number): void {
+    if (t1 - t0 < 0.4) return;
+    const ctx = this.ctx;
+    const dest = this.engine.oneShotBus;
+
+    const lp = ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.Q.value = 0.7;
+    lp.frequency.setValueAtTime(700, t0);
+    lp.frequency.exponentialRampToValueAtTime(13000, t1);
+
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(FLOOR, t0);
+    g.gain.exponentialRampToValueAtTime(SWELL_NOISE_PEAK, t1);
+    g.gain.linearRampToValueAtTime(FLOOR, t1 + 0.06);
+    g.connect(dest);
+
+    const n = ctx.createBufferSource();
+    n.buffer = noiseBuffer(ctx);
+    n.loop = true;
+    n.connect(lp).connect(g);
+    n.start(t0);
+    n.stop(t1 + 0.1);
+
+    const mStart = Math.max(t0, t1 - 1.15);
+    const m = ctx.createBufferSource();
+    m.buffer = metalBuffer(ctx);
+    const hp = ctx.createBiquadFilter();
+    hp.type = 'highpass';
+    hp.frequency.value = 2200;
+    const mg = ctx.createGain();
+    mg.gain.setValueAtTime(FLOOR, mStart);
+    mg.gain.exponentialRampToValueAtTime(SWELL_METAL_PEAK, t1);
+    mg.gain.linearRampToValueAtTime(FLOOR, t1 + 0.06);
+    m.connect(hp).connect(mg).connect(dest);
+    // Below 1x the 1.2 s buffer lasts 1.46 s, so it covers the window it starts in.
+    m.playbackRate.setValueAtTime(0.82, mStart);
+    m.playbackRate.exponentialRampToValueAtTime(1.35, t1);
+    m.start(mStart);
+    m.stop(t1 + 0.1);
+  }
+
+  /**
+   * The decks' own high-pass climbing, plus the optional accelerando.
+   *
+   * Deck.setFilter is the only handle on the deck path we can move without
+   * stealing a param someone else owns, and it is the right one: the sweep is
+   * per-deck and the on-screen knob follows it, so the surface tells the truth
+   * about what the build did. See integration notes for the engine-level filter
+   * that would make this a scheduled AudioParam ramp instead of a timer.
+   */
+  private startSweep(t0: number, t1: number, rise: boolean): void {
+    this.stopSweep();
+    // Cleared before the early return, not only in endSweep: a stale snapshot
+    // would restore a filter position from two macros ago.
+    this.tensed = [];
+    const decks = this.engine.decks.filter((d) => d.loaded);
+    if (!decks.length) return;
+    this.tensed = decks.map((d) => ({
+      deck: d,
+      filterKnob: d.filterKnob,
+      tempoPercent: d.tempoPercent,
+      wroteFilter: d.filterKnob,
+      wroteTempo: d.tempoPercent,
+    }));
+
+    const span = t1 - t0;
+    if (span < 0.3) return;
+    this.sweepTimer = window.setInterval(() => {
+      const u = clamp((this.ctx.currentTime - t0) / span, 0, 1);
+      const shaped = Math.pow(u, BUILD_HP_SHAPE);
+      for (const s of this.tensed) {
+        // Hands win, exactly as easeCrossfade treats the fader: if the live
+        // value is not what we last wrote, somebody grabbed the knob.
+        if (Math.abs(s.deck.filterKnob - s.wroteFilter) <= HAND_EPS_FILTER) {
+          // From wherever the knob was, not from zero — a deck already filtered
+          // by hand keeps that as its starting point.
+          s.deck.setFilter(clamp(s.filterKnob + (BUILD_HP_TOP - s.filterKnob) * shaped, -1, 1));
+          s.wroteFilter = s.deck.filterKnob;
+        }
+        if (rise && u > RISE_FROM && Math.abs(s.deck.tempoPercent - s.wroteTempo) <= HAND_EPS_TEMPO) {
+          const w = (u - RISE_FROM) / (1 - RISE_FROM);
+          s.deck.setTempoPercent(s.tempoPercent + BUILD_TEMPO_PCT * w);
+          s.wroteTempo = s.deck.tempoPercent;
+        }
+      }
+      if (u >= 1) this.stopSweep();
+    }, SWEEP_TICK_MS);
+  }
+
+  private stopSweep(): void {
+    if (this.sweepTimer === null) return;
+    window.clearInterval(this.sweepTimer);
+    this.sweepTimer = null;
+  }
+
+  /** Put the decks back exactly, unless a hand moved them while we were away. */
+  private endSweep(): void {
+    this.stopSweep();
+    const tensed = this.tensed;
+    this.tensed = [];
+    for (const s of tensed) {
+      if (
+        Math.abs(s.deck.filterKnob - s.wroteFilter) <= HAND_EPS_FILTER &&
+        s.deck.filterKnob !== s.filterKnob
+      ) {
+        s.deck.setFilter(s.filterKnob);
+      }
+      if (
+        Math.abs(s.deck.tempoPercent - s.wroteTempo) <= HAND_EPS_TEMPO &&
+        s.deck.tempoPercent !== s.tempoPercent
+      ) {
+        s.deck.setTempoPercent(s.tempoPercent);
+      }
+    }
+  }
+
+  /** endSweep plus the build's own bookkeeping. */
+  private endTension(): void {
+    for (const id of this.tensionTimers) window.clearTimeout(id);
+    this.tensionTimers.clear();
+    this.endSweep();
+    if (this.active === 'build') {
+      this.active = this.latch;
+      this.busyUntil = 0;
+    }
+    this.engine.notify();
+  }
+
+  /* ------------------------------------------------- the platter engines */
+
+  /**
+   * Take hold of the playing records and drive their velocity.
+   *
+   * The one subtlety: Deck.scratchStart seeds the platter at velocity ZERO, so a
+   * bare grab is a dead stop, not a wind-down. The scratchRate immediately after
+   * it re-points the platter at the deck's own speed, and the worklet's 12 ms
+   * one-pole covers the ~4 ms of handover.
+   */
+  private grab(decks: Deck[], kind: DropKind, t0: number, t1: number): void {
+    // busyUntil should already make a second grab impossible, but an orphaned
+    // interval here would drive scratchRate on decks nothing is tracking, and
+    // there would be no way left to free them. One line buys that away.
+    this.stopScratchTimer();
+    const span = Math.max(0.05, t1 - t0);
+    for (const d of decks) {
+      // Re-checked at fire time, not just at schedule time: two bars is plenty
+      // of time for a child to have grabbed the platter or unloaded the song.
+      if (!d.loaded || d.scratching) continue;
+      const rate = clamp(fin(1 + d.tempoPercent / 100, 1), 0.25, 4);
+      this.held.push({ deck: d, posAtGrab: d.positionSecNow, grabAt: this.ctx.currentTime, rate });
+      d.scratchStart();
+      d.scratchRate(rate);
+    }
+    if (!this.held.length) return;
+
+    this.scratchTimer = window.setInterval(() => {
+      const u = clamp((this.ctx.currentTime - t0) / span, 0, 1);
+      const f =
+        kind === 'reverse'
+          ? 1 - REV_DEPTH * Math.pow(u, REV_SHAPE)
+          : Math.pow(1 - u, STOP_SHAPE);
+      for (const h of this.held) h.deck.scratchRate(h.rate * f);
+      if (u >= 1) {
+        this.stopScratchTimer();
+        // Park it. The master gate is already at zero here, so this is silent
+        // and only matters for where the record is when we catch it back up.
+        for (const h of this.held) h.deck.scratchRate(0);
+      }
+    }, SCRATCH_TICK_MS);
+  }
+
+  /**
+   * Catch the record up and spin it back to full speed.
+   *
+   * The seek target is computed from the clock AT THE INSTANT THIS FIRES, not
+   * from the scheduled slam time, so main-thread jitter changes WHEN the record
+   * comes back and never WHERE. That is the same self-correcting property
+   * alignPhaseTo relies on, and it is what keeps a tape stop from leaving the
+   * song half a bar behind the drums for the rest of the night.
+   */
+  private spinUp(): void {
+    const now = this.ctx.currentTime;
+    for (const h of this.held) {
+      const virtual = h.posAtGrab + (now + SPIN_LEAD - h.grabAt) * h.rate;
+      h.deck.seekSeconds(this.wrapInto(h.deck, virtual - SPIN_ADVANCE * h.rate), true);
+      h.deck.scratchRate(h.rate);
+    }
+  }
+
+  /** Hand every platter back to the stretch engine. Idempotent by construction. */
+  private release(): void {
+    this.stopScratchTimer();
+    const held = this.held;
+    this.held = [];
+    // scratchEnd is a no-op on a deck that is not scratching, so a hand that
+    // took over mid-drop is not yanked out from under the child.
+    for (const h of held) h.deck.scratchEnd(true);
+  }
+
+  private stopScratchTimer(): void {
+    if (this.scratchTimer === null) return;
+    window.clearInterval(this.scratchTimer);
+    this.scratchTimer = null;
+  }
+
+  /** A catch-up target has to respect a hook loop, or it lands outside it. */
+  private wrapInto(deck: Deck, sec: number): number {
+    const v = fin(sec, 0);
+    const s = deck.loopStartSec;
+    const e = deck.loopEndSec;
+    if (deck.loop && s != null && e != null && e - s > 0.05) {
+      const span = e - s;
+      const r = (v - s) % span;
+      return s + (r < 0 ? r + span : r);
+    }
+    return clamp(v, 0, Math.max(0, deck.durationSec - 0.05));
   }
 
   /* ------------------------------------------------------------ auto-mix */
@@ -387,8 +1055,9 @@ export class Macros {
     // Songs out on the deck bus only. The drums sit downstream of it, on the sum
     // bus, so they are untouched by this — that separation is the macro.
     const db = this.engine.deckBus.gain;
-    // Armed before the mute, for the same reason as bigDrop: a throw between the
-    // two would leave the songs ducked to silence with nothing to restore them.
+    // Armed before the mute, for the same reason as the drop: a throw between
+    // the two would leave the songs ducked to silence with nothing to restore
+    // them.
     this.watchdog(db, back + 0.4);
     this.holdAt(db, now);
     db.linearRampToValueAtTime(1, now + 0.02);
@@ -413,13 +1082,19 @@ export class Macros {
   /* ---------------------------------------------------------- bump boost */
 
   /**
-   * Makes the beats powerful: low shelf on the drum bus, soft-clip drive to give
-   * the transients weight, and a kick-keyed duck on the songs so the beat punches
-   * a hole rather than fighting for one.
+   * Makes the whole thing hit harder — the DRUMS and the SONGS, which is the
+   * half that used to be missing.
    *
-   * Peak-safe by construction — -6 dB of trim pays back the drive's small-signal
-   * gain, so the peak level barely moves and the limiter is the net, not the
-   * operating point.
+   * Drums: low shelf, soft-clip drive, trim.
+   * Songs: the same shelf-and-drive treatment on the deck path when AudioEngine
+   *        provides deckLow/deckPre/deckDrive, plus makeup and a deeper kick-keyed
+   *        duck on deckDuck either way. See the headroom block at the top of this
+   *        file for why every one of those numbers is what it is; the short
+   *        version is that the master limiter has 3.0 dB of room and this spends
+   *        1.5 dB of it.
+   *
+   * The sidechain stays: the beat punching a hole in the songs is what makes the
+   * songs sound louder in the gaps, and it is free.
    */
   setBump(on: boolean): void {
     // Already-there check first, so releaseAll()'s setBump(false) on a cold
@@ -429,20 +1104,36 @@ export class Macros {
     const e = this.engine;
     const t = this.ctx.currentTime;
     const trim = e.drumTrim.gain;
+    const sh = this.shaper();
 
     e.drumLow.gain.setTargetAtTime(on ? BUMP_SHELF_DB : 0, t, 0.05);
+    if (sh) {
+      sh.deckLow.frequency.setValueAtTime(DECK_SHELF_HZ, t);
+      sh.deckLow.gain.setTargetAtTime(on ? DECK_SHELF_DB : 0, t, 0.05);
+    }
 
     // Swapping a WaveShaper curve is an instantaneous change of transfer
-    // function, i.e. a level step. Fade the trim through the swap instead.
+    // function, i.e. a level step. Fade the trims through the swap instead.
     if (this.bumpTimer !== null) window.clearTimeout(this.bumpTimer);
     this.holdAt(trim, t + 0.001);
     trim.linearRampToValueAtTime(FLOOR, t + 0.001 + SWAP_FADE);
+    if (sh) {
+      // The songs DIP rather than mute: 10 ms of silence is inaudible on a
+      // percussive bus and very audible on a sustained one.
+      this.holdAt(sh.deckPre.gain, t + 0.001);
+      sh.deckPre.gain.linearRampToValueAtTime(SWAP_DIP, t + 0.001 + SWAP_FADE);
+    }
     this.bumpTimer = window.setTimeout(() => {
       this.bumpTimer = null;
       e.drumDrive.curve = on ? this.curve() : null;
       const t2 = this.ctx.currentTime;
       trim.setValueAtTime(FLOOR, t2);
       trim.linearRampToValueAtTime(on ? BUMP_TRIM : 1, t2 + SWAP_FADE);
+      if (sh) {
+        sh.deckDrive.curve = on ? this.curve() : null;
+        sh.deckPre.gain.setValueAtTime(SWAP_DIP, t2);
+        sh.deckPre.gain.linearRampToValueAtTime(on ? DECK_PRE : 1, t2 + SWAP_FADE);
+      }
     }, (0.002 + SWAP_FADE) * 1000);
 
     if (on) {
@@ -450,6 +1141,11 @@ export class Macros {
       this.bumpLayers = this.ensureDrums();
       this.unsubSidechain = e.transport.onStep(this.onSidechainStep);
       this.bumpOn = true;
+      // Lift the songs now rather than waiting for the first kick, or the pad
+      // sounds like it did nothing until the beat comes round.
+      const duck = e.deckDuck.gain;
+      this.holdAt(duck, t + 0.001);
+      duck.linearRampToValueAtTime(BUMP_BASE, t + 0.031);
     } else {
       // BeatMachine never unsubscribes from the transport; Macros must, or every
       // toggle leaks a handler.
@@ -471,12 +1167,25 @@ export class Macros {
   }
 
   /**
+   * The deck-path shaper, if AudioEngine has it. Structural rather than declared
+   * on AudioEngine so this file compiles and runs either way: without the nodes
+   * bump still lifts and pumps the songs through deckDuck, it just cannot shelf
+   * or saturate them.
+   */
+  private shaper(): DeckShaper | null {
+    const e = this.engine as AudioEngine & Partial<DeckShaper>;
+    if (!e.deckLow || !e.deckPre || !e.deckDrive) return null;
+    return { deckLow: e.deckLow, deckPre: e.deckPre, deckDrive: e.deckDrive };
+  }
+
+  /**
    * Sidechain, keyed off the groove rather than an envelope follower — Web Audio
    * has no sidechain input on DynamicsCompressorNode, and the pattern is known
    * ahead of time anyway.
    *
-   * Both ramps are scheduled atomically at kick time so the param returns to 1
-   * on its own: stopping the transport mid-duck cannot strand the songs quiet.
+   * Both ramps are scheduled atomically at kick time so the param returns to its
+   * base on its own: stopping the transport mid-duck cannot strand the songs
+   * quiet.
    */
   private onSidechainStep = (step: number, time: number): void => {
     if (!this.bumpOn) return;
@@ -487,7 +1196,7 @@ export class Macros {
     if (!(stepDur > 0.005 && stepDur < 0.5)) return; // nonsense bpm: skip, do not schedule garbage
 
     // The release has to finish before the NEXT kick ducks, or that duck's
-    // anchoring setValueAtTime(1) lands mid-ramp and steps 3.7 dB in one block.
+    // anchoring setValueAtTime lands mid-ramp and steps 5.6 dB in one block.
     // Trap at 174 bpm is the worst case: a 2-sixteenth gap leaves 23% margin.
     let gapSteps = 16;
     for (const k of bm.groove.kick) {
@@ -497,9 +1206,9 @@ export class Macros {
     const release = clamp(gapSteps * stepDur * 0.7, 0.05, 0.22);
 
     const g = this.engine.deckDuck.gain;
-    g.setValueAtTime(1, time - 0.004);
-    g.linearRampToValueAtTime(1 - BUMP_DEPTH, time + DUCK_IN);
-    g.linearRampToValueAtTime(1, time + DUCK_IN + release);
+    g.setValueAtTime(BUMP_BASE, time - 0.004);
+    g.linearRampToValueAtTime(BUMP_FLOOR, time + DUCK_IN);
+    g.linearRampToValueAtTime(BUMP_BASE, time + DUCK_IN + release);
     // Deliberately no notify() — this runs 4-16 times a second.
   };
 
@@ -522,9 +1231,18 @@ export class Macros {
   cancel(): void {
     for (const id of this.timers) window.clearTimeout(id);
     this.timers.clear();
+    // Those ids are dead now; leaving them in the map would make the next
+    // watchdog clear a timeout some later macro has been handed by the browser.
+    this.watchdogs.clear();
     this.stopEase();
+    // Before the param restores: a platter left holding velocity 0 is a deck
+    // that reads as playing and makes no sound, and clearing the timers above
+    // just removed the thing that would have freed it.
+    this.release();
+    this.endTension();
 
     this.active = null;
+    this.dropKind = null;
     this.latch = null;
     this.busyUntil = 0;
     if (!this.nodesWired()) {
@@ -533,14 +1251,15 @@ export class Macros {
     }
 
     const t = this.ctx.currentTime + 0.005;
-    for (const p of [
-      this.engine.macroGain.gain,
-      this.engine.deckBus.gain,
-      this.engine.deckDuck.gain,
-    ]) {
+    for (const p of [this.engine.macroGain.gain, this.engine.deckBus.gain]) {
       this.holdAt(p, t);
       p.linearRampToValueAtTime(1, t + 0.03);
     }
+    // The duck's home is not 1 while bump is on; sending it there would drop the
+    // songs 1.9 dB until the next kick re-anchored them.
+    const duck = this.engine.deckDuck.gain;
+    this.holdAt(duck, t);
+    duck.linearRampToValueAtTime(this.bumpOn ? BUMP_BASE : 1, t + 0.03);
 
     if (this.snap) {
       const s = this.snap;
@@ -623,31 +1342,62 @@ export class Macros {
     }
   }
 
-  /** Tracked setTimeout, removed from the set as it fires. */
-  private after(sec: number, fn: () => void): void {
+  /**
+   * Tracked setTimeout, removed from its set as it fires. Returns the id so a
+   * caller that must retire its own earlier timer can find it again.
+   */
+  private afterIn(set: Set<number>, sec: number, fn: () => void): number {
     const id = window.setTimeout(
       () => {
-        this.timers.delete(id);
+        set.delete(id);
         fn();
       },
       Math.max(0, sec) * 1000
     );
-    this.timers.add(id);
+    set.add(id);
+    return id;
+  }
+
+  private after(sec: number, fn: () => void): void {
+    this.afterIn(this.timers, sec, fn);
   }
 
   /**
    * Silence is the worst thing this file could leave behind, so every scheduled
    * slam is checked afterwards and forced home if an exception got between the
    * cut and the return.
+   *
+   * ONE ARMED CHECK PER PARAM, NEWEST WINS. A check left over from a FINISHED
+   * macro is not merely useless, it is destructive: it wakes up, finds a param
+   * that the NEXT macro has legitimately pulled to zero, and forces the gate
+   * open in the middle of that macro's hole — and because it holds the param
+   * first, it also wipes the slam still sitting on the timeline, so the mix
+   * never comes back louder. It is reachable on the DEFAULTS: at 120 bpm a
+   * 4-bar build lands at 10.0 s and arms its check for 14.4 s, and a tapestop
+   * tapped a beat later cuts at 14.0 s and returns at 14.5 s, putting the stale
+   * check 400 ms inside a 500 ms silence. Re-arming on a param therefore
+   * retires whatever was already watching it.
+   *
+   * Scoped per PARAM rather than by a global generation, because a macro that
+   * never touches deckBus must not disarm the bridge's check on it.
    */
   private watchdog(p: AudioParam, at: number): void {
-    this.after(at - this.ctx.currentTime, () => {
+    const prev = this.watchdogs.get(p);
+    if (prev !== undefined) {
+      window.clearTimeout(prev);
+      this.timers.delete(prev);
+    }
+    let id = 0;
+    id = this.afterIn(this.timers, at - this.ctx.currentTime, () => {
+      // Only vacate the slot if it is still ours; a re-arm owns it now.
+      if (this.watchdogs.get(p) === id) this.watchdogs.delete(p);
       if (p.value >= 0.5) return;
       const t = this.ctx.currentTime + 0.005;
       this.holdAt(p, t);
       p.linearRampToValueAtTime(1, t + 0.03);
       console.warn('[macros] a gate was still down after a macro; forced back up');
     });
+    this.watchdogs.set(p, id);
   }
 
   /* ------------------------------------------------------------- the parts */
@@ -720,7 +1470,7 @@ export class Macros {
     o.stop(t1 + 0.05);
   }
 
-  /** Eight accelerating snares into the hit — the last bar of a build. */
+  /** Eight accelerating snares into the hit — the last bar of a bridge. */
   private fill(t0: number, t1: number): void {
     const step = (t1 - t0) / 8;
     if (step < 0.01) return;

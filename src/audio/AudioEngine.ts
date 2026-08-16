@@ -207,6 +207,9 @@ export class AudioEngine {
     this.recorderNode.connect(this.ctx.destination);
 
     this.transport = new Transport(this.ctx);
+    // Keep the drum grid locked to whatever the room is listening to, instead
+    // of merely starting aligned with it.
+    this.transport.beatPhaseSource = () => this.anchorNextBeatTime();
     this.fx = new Fx(this);
     this.beatMachine = new BeatMachine(this);
     // Drums take their own path to the sum so bump boost can thicken them and
@@ -276,6 +279,20 @@ export class AudioEngine {
     }
     this.transport.start(this.ctx.currentTime + Math.max(lead, 0.04));
     this.notify();
+  }
+
+  /**
+   * ctx time of the anchor deck's next beat — the transport's phase reference.
+   * Null while nothing is playing or a platter is being scratched, since a
+   * playhead under a hand is not a tempo reference.
+   */
+  anchorNextBeatTime(): number | null {
+    const a = this.anchorDeck();
+    if (!a?.analysis || !a.playing || a.scratching) return null;
+    const phase = a.beatPhaseNow();
+    if (phase == null) return null;
+    const bpm = a.effectiveBpm || 120;
+    return this.ctx.currentTime + (1 - phase) * (60 / bpm);
   }
 
   /** Follow the anchor deck's tempo while the beat is running. */
