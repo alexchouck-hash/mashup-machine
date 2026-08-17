@@ -37,6 +37,9 @@ const velAmp = (v: number): number => 0.15 + 0.85 * v * v;
 const velTone = (v: number): number => 0.35 + 0.65 * v;
 const velTime = (v: number): number => 0.7 + 0.3 * v;
 
+/** Gentle enough to darken without resonating. */
+const TONE_Q = 0.7;
+
 export type PadFallback = (
   ctx: BaseAudioContext,
   dest: AudioNode,
@@ -171,6 +174,46 @@ validatePacks(DRUM_PACKS);
  * transport's step handler.
  */
 /**
+ * What a velocity SOUNDS like: how long, how loud, how dull.
+ *
+ * ONE place decides all three, because this file has TWO entry points — the
+ * SCHEDULED `padVoice` and the LIVE `padVoiceLive` — and the second copy of
+ * this arithmetic is precisely how a soft tap ends up brighter under the finger
+ * than the identical hit is when the take loops it back. It was latent while
+ * every live tap was velocity 1 (nothing filters at full velocity, so the two
+ * chains agreed by accident); wiring strike height to the live path made the
+ * disagreement audible on every tap below full. The melody surface had to learn
+ * the same lesson — see `MelodyLooper.shape`.
+ *
+ * `toneHz` is null at full velocity rather than "wide open": a hard hit inserts
+ * no biquad at all, which is what the scheduled path has always done.
+ */
+function padShape(
+  ctx: BaseAudioContext,
+  bufSec: number,
+  gain: number,
+  vel: number,
+  maxSec: number
+): { dur: number; peak: number; toneHz: number | null } {
+  const v = clamp(fin(vel, 1), 0, 1);
+  return {
+    dur: Math.min(clamp(fin(maxSec, 0.3), 0.02, 4) * velTime(v), bufSec),
+    peak: clamp(fin(gain, 1) * velAmp(v), FLOOR, 8),
+    // A quiet hit is duller as well as softer — a drum struck gently excites
+    // less of the top end. Without this a soft tap is merely a small loud tap.
+    toneHz: v < 0.99 ? clamp(1200 + 14000 * velTone(v), 20, ctx.sampleRate / 2 - 100) : null,
+  };
+}
+
+function toneFilter(ctx: BaseAudioContext, hz: number): BiquadFilterNode {
+  const lp = ctx.createBiquadFilter();
+  lp.type = 'lowpass';
+  lp.frequency.value = hz;
+  lp.Q.value = TONE_Q;
+  return lp;
+}
+
+/**
  * Play a pad NOW and hand back a handle, so a finger still on the pad can bend
  * and swell the note it just struck.
  *
@@ -200,17 +243,18 @@ export function padVoiceLive(
     return DEAD_HANDLE;
   }
 
+  const { dur, peak, toneHz } = padShape(ctx, buf.duration, g, v, spec.maxSec);
+  // Same refusal the scheduled path makes: a degenerate length is not a quiet
+  // hit, it is silence, and silence live where the loop synthesises is drift.
+  if (!(dur > 0.02)) {
+    spec.fallback(ctx, dest, t, g, v);
+    return DEAD_HANDLE;
+  }
+
   const src = ctx.createBufferSource();
   src.buffer = buf;
-  const dur = Math.min(clamp(fin(spec.maxSec, 0.3), 0.02, 4) * velTime(v), buf.duration);
 
-  const { input, handle } = makeExpression(
-    ctx,
-    dest,
-    clamp(g * velAmp(v), FLOOR, 8),
-    src.playbackRate,
-    1
-  );
+  const { input, handle } = makeExpression(ctx, dest, peak, src.playbackRate, 1);
 
   // The envelope lives on a node INSIDE the expression chain, so the gesture's
   // gain writes and the tail ride cannot fight over one param.
@@ -219,7 +263,11 @@ export function padVoiceLive(
   env.gain.setValueAtTime(1, t + dur * 0.72);
   env.gain.exponentialRampToValueAtTime(FLOOR, t + dur);
 
-  src.connect(env).connect(input);
+  // source -> tone -> envelope, the same order the scheduled chain uses. A
+  // biquad is linear so its position among the gains is acoustically free; the
+  // point of matching is that one graph shape is one thing to reason about.
+  if (toneHz !== null) src.connect(toneFilter(ctx, toneHz)).connect(env).connect(input);
+  else src.connect(env).connect(input);
   src.start(t);
   src.stop(t + dur + 0.02);
   return handle;
@@ -238,31 +286,23 @@ function sampleVoice(
   if (!buf) return false;
 
   const t = Math.max(0, fin(time, ctx.currentTime));
-  const v = clamp(fin(accent, 1), 0, 1);
-  const dur = Math.min(clamp(fin(maxSec, 0.3), 0.02, 4) * velTime(v), buf.duration);
+  // Length, level and tone come from `padShape`, not from a local copy of the
+  // curves — that shared decision is the whole point of the helper.
+  const { dur, peak, toneHz } = padShape(ctx, buf.duration, gain, accent, maxSec);
   if (!(dur > 0.02)) return false;
 
   const src = ctx.createBufferSource();
   src.buffer = buf;
 
   const g = ctx.createGain();
-  const peak = clamp(fin(gain, 1) * velAmp(v), FLOOR, 8);
   g.gain.setValueAtTime(peak, t);
   // Ride the tail down rather than cutting it: a hard stop on a decaying cymbal
   // is a click, and at sixteenths that click lands on every hit.
   g.gain.setValueAtTime(peak, t + dur * 0.72);
   g.gain.exponentialRampToValueAtTime(FLOOR, t + dur);
 
-  if (v < 0.99) {
-    // A quiet hit is duller as well as softer.
-    const lp = ctx.createBiquadFilter();
-    lp.type = 'lowpass';
-    lp.frequency.value = clamp(1200 + 14000 * velTone(v), 20, ctx.sampleRate / 2 - 100);
-    lp.Q.value = 0.7;
-    src.connect(lp).connect(g).connect(dest);
-  } else {
-    src.connect(g).connect(dest);
-  }
+  if (toneHz !== null) src.connect(toneFilter(ctx, toneHz)).connect(g).connect(dest);
+  else src.connect(g).connect(dest);
 
   src.start(t);
   src.stop(t + dur + 0.02);

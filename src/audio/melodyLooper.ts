@@ -1,6 +1,7 @@
 import type { AudioEngine } from './AudioEngine';
 import { hzFor, scaleOf } from './melody';
-import { MELODY_VOICES, playVoiceSample } from './melodyVoices';
+import { MELODY_VOICES, playVoiceLive, playVoiceSample, type MelodyVoice } from './melodyVoices';
+import { DEAD_HANDLE, type VoiceHandle } from './expression';
 import { GridClock, TakeLooper, type Take, type TakeHooks, type TakeVoice, type Tap } from './takeLooper';
 import type { KeyMode } from './types';
 
@@ -139,23 +140,21 @@ export class MelodyLooper {
     const voice: TakeVoice<number> = {
       play: (ctx, dest, time, midi, gain, vel) => {
         if (!Number.isFinite(midi)) return;
-        // Read the voice LIVE, never captured: switching instrument re-voices
-        // every committed take, exactly as switching a drum pack does.
-        const v = MELODY_VOICES[this.voiceIndex] ?? MELODY_VOICES[0];
-
-        // hzFor's own midi arithmetic, fed the note's own octave, so there is no
-        // second copy of the equal-temperament formula in this repo.
-        const hz = hzFor(((midi % 12) + 12) % 12, 0, Math.floor(midi / 12) - 1);
-        const beat = 60 / (this.engine.transport.bpm || 120);
-        // Notes shorten as the tempo rises, so a fast song does not turn a
-        // melody into a drone.
-        const dur = clamp(beat * v.holdBeats, 0.12, v.maxSec);
-        const level = 0.3 * v.gain * clamp(gain, 0, 4) * (0.4 + 0.6 * clamp(vel, 0, 1));
-
+        const s = this.shape(midi, gain, vel);
         // Sample first; synthesis is the fallback, so a stripped deployment or a
         // kit still decoding degrades to a tone rather than to silence.
-        if (playVoiceSample(ctx, dest, time, v, midi, level, dur)) return;
-        v.synth(ctx, dest, time, hz, dur, level);
+        if (playVoiceSample(ctx, dest, time, s.v, midi, s.level, s.dur)) return;
+        s.v.synth(ctx, dest, time, s.hz, s.dur, s.level);
+      },
+      // The LIVE path: the same voice, the same level and the same duration —
+      // `shape` is the single source of all three, so a note under a finger and
+      // the same note out of the loop cannot drift apart — built through the
+      // expression chain instead, which keeps the gain and the playbackRate
+      // reachable after the call. The scheduled `play` above is untouched.
+      playLive: (ctx, dest, midi, gain, vel) => {
+        if (!Number.isFinite(midi)) return DEAD_HANDLE;
+        const s = this.shape(midi, gain, vel);
+        return playVoiceLive(ctx, dest, s.v, midi, s.hz, s.level, s.dur);
       },
       // The note IS the identity: two takes playing the same note at the same
       // instant merge, but a chord across takes survives.
@@ -183,6 +182,35 @@ export class MelodyLooper {
       hooks
     );
     this.output = this.looper.output;
+  }
+
+  /**
+   * Instrument, pitch, length and level for one note — the ONE place any of the
+   * four is decided.
+   *
+   * Extracted because there are now two callers (scheduled and live) and a
+   * second copy of this arithmetic would let a note under a finger and the same
+   * note coming back out of the loop drift apart in level or length, which is
+   * exactly the bug a child would report as "it sounds different when it
+   * repeats".
+   */
+  private shape(
+    midi: number,
+    gain: number,
+    vel: number
+  ): { v: MelodyVoice; hz: number; dur: number; level: number } {
+    // Read the voice LIVE, never captured: switching instrument re-voices every
+    // committed take, exactly as switching a drum pack does.
+    const v = MELODY_VOICES[this.voiceIndex] ?? MELODY_VOICES[0];
+    // hzFor's own midi arithmetic, fed the note's own octave, so there is no
+    // second copy of the equal-temperament formula in this repo.
+    const hz = hzFor(((midi % 12) + 12) % 12, 0, Math.floor(midi / 12) - 1);
+    const beat = 60 / (this.engine.transport.bpm || 120);
+    // Notes shorten as the tempo rises, so a fast song does not turn a melody
+    // into a drone.
+    const dur = clamp(beat * v.holdBeats, 0.12, v.maxSec);
+    const level = 0.3 * v.gain * clamp(gain, 0, 4) * (0.4 + 0.6 * clamp(vel, 0, 1));
+    return { v, hz, dur, level };
   }
 
   /* ---------------------------------------------------------------- theory */
@@ -269,12 +297,17 @@ export class MelodyLooper {
    *    The key that ACTUALLY sounded is the one that flashes, so a child sees
    *    that their press was moved.
    *
-   * Returns the midi note that sounded, or -1 if the tap was swallowed by the
-   * retrigger guard.
+   * Returns the sounding voice's HANDLE, so a finger still on the key can bend
+   * and swell it, or null if the retrigger guard swallowed the tap.
+   *
+   * It used to return the midi note that sounded. Nothing read that number — the
+   * key that sounded already announces itself through `flash`, which is what
+   * lights the keybed and therefore what shows a child that auto-tune moved
+   * their press.
    */
-  tap(midi: number, vel = 1): number {
+  tap(midi: number, vel = 1): VoiceHandle | null {
     const note = this.autoTune ? snapToKey(midi, this.key()) : midi;
-    return this.looper.tap(note, vel) ? note : -1;
+    return this.looper.tap(note, vel);
   }
 
   setAutoTune(on: boolean): void {

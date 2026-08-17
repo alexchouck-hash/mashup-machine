@@ -1,6 +1,15 @@
 import type { AudioEngine } from './AudioEngine';
 import { clap, hat, kick, openHat, snare, sub, subRootHz } from './drums';
-import { BOOM_SLOT, DRUM_PACKS, PAD_COUNT, PAD_LABELS, padVoice, type DrumPack } from './drumPacks';
+import {
+  BOOM_SLOT,
+  DRUM_PACKS,
+  PAD_COUNT,
+  PAD_LABELS,
+  padVoice,
+  padVoiceLive,
+  type DrumPack,
+} from './drumPacks';
+import { DEAD_HANDLE, type VoiceHandle } from './expression';
 import { hzFor, progressionFor, stab, triadSemitones } from './melody';
 import { MelodyLooper, anchorKey } from './melodyLooper';
 import { MELODY_VOICES } from './melodyVoices';
@@ -171,8 +180,16 @@ export class BeatMachine {
    * React, and the toggle would light a frame late or not at all.
    */
 
-  /** Play a note now and record it into the open take. */
-  tapKey(midi: number, velocity = 1): number {
+  /**
+   * Play a note now and record it into the open take.
+   *
+   * Returns the sounding voice's HANDLE so the caller can shape it while the
+   * finger is down, or null if the retrigger guard swallowed the tap. It used to
+   * return the midi note that actually sounded (auto-tune can move it); nothing
+   * read that, and the key that sounded still identifies itself the way it
+   * always did — through `keys.flash`, which is what lights the keybed.
+   */
+  tapKey(midi: number, velocity = 1): VoiceHandle | null {
     return this.keys.tap(midi, velocity);
   }
 
@@ -263,6 +280,15 @@ export class BeatMachine {
         const spec = this.pack.slots[slot];
         if (!spec) return;
         padVoice(c, dest, time, spec, gain, vel);
+      },
+      // The LIVE path. Same pack lookup, same slot gain, same bus — the only
+      // difference is that this one keeps the gain node and the playbackRate
+      // reachable after it returns, which is what a finger needs to bend and
+      // swell the hit it just made. The scheduled `play` above is untouched.
+      playLive: (c, dest, slot, gain, vel) => {
+        const spec = this.pack.slots[slot];
+        if (!spec) return DEAD_HANDLE;
+        return padVoiceLive(c, dest, spec, gain, vel);
       },
       keyOf: (slot) => slot,
     };

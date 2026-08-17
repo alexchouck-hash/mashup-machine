@@ -4,6 +4,7 @@ import { engine } from '../audio/AudioEngine';
 import type { Deck } from '../audio/Deck';
 import { OCTAVE_LABELS } from '../audio/melodyLooper';
 import { MELODY_VOICES } from '../audio/melodyVoices';
+import { gestureToBend, gestureToLevel, velocityFromY, type VoiceHandle } from '../audio/expression';
 import { JAMS, prewarmJams, renderJam, type JamSpec } from '../audio/jamFactory';
 import { downloadBlob, recordingFilename } from '../audio/wav';
 import { useEngineVersion } from '../hooks/useEngine';
@@ -186,6 +187,124 @@ function BigPad({ emoji, label, color, active, disabled, onPress, onRelease }: P
       <span className="pad-label">{label}</span>
     </button>
   );
+}
+
+/* --------------------------------------------------------- expressive taps */
+
+/**
+ * EXPRESSIVE TAPS — velocity from where you hit, then bend and swell while held.
+ *
+ * The owner's ask: "the volume should be louder if a pad is hit higher on the
+ * screen and softer if lower. You should be able to hold then slide your mouse
+ * left / right to bend. up / down to make louder or softer."
+ *
+ * Two rules govern everything below.
+ *
+ * NOTHING PER FRAME GOES THROUGH REACT. pointermove fires at ~60 Hz PER POINTER,
+ * and a child playing a chord has three of them. The handle lives in a ref and
+ * `moveGesture` writes AudioParams directly — exactly what the visualizer, the
+ * platter, the step dots and both loop surfaces already do. A single
+ * `engine.notify()` on this path would re-render the whole rack sixty times a
+ * second for a value React never reads.
+ *
+ * EXACTLY ONE RELEASE PER PRESS, whatever ends it. A pad that becomes disabled
+ * mid-gesture gets `pointer-events:none` and never sees its own pointerup; a
+ * finger sliding off delivers the up somewhere else entirely; and
+ * `lostpointercapture` fires after a NORMAL pointerup as well as after a lost
+ * one. `endGesture` therefore deletes from the map BEFORE releasing, so the
+ * second and third arrivals find nothing and no-op. That is the same latch
+ * `BigPad` above uses, for the same reasons — there is deliberately not a second
+ * answer to this problem in this file.
+ */
+interface Gesture {
+  handle: VoiceHandle;
+  /** Where the finger landed, and the size of what it landed on. */
+  x0: number;
+  y0: number;
+  w: number;
+  h: number;
+  /** The struck control, so the hold marker comes off whatever ends the press. */
+  el: HTMLElement;
+}
+
+/** Velocity from where a control was struck: top loud, bottom soft. */
+function strikeVelocity(r: DOMRect, y: number): number {
+  // velocityFromY takes 0 at the TOP, which is how DOM coordinates already
+  // arrive, and floors at 0.35 so the bottom edge is quiet rather than broken.
+  return velocityFromY(r.height > 0 ? (y - r.top) / r.height : 0.5);
+}
+
+/**
+ * Start holding the voice a tap just made.
+ *
+ * Releases whatever this pointer was holding FIRST, which is what makes a
+ * keyboard glissando re-strike correctly: the new key gets its own handle and
+ * the old one is let go, rather than two notes ending up under one finger.
+ *
+ * A null handle means the looper's retrigger guard swallowed the tap. Nothing
+ * sounded, so there is nothing to hold and nothing to mark.
+ */
+function beginGesture(
+  live: Map<number, Gesture>,
+  id: number,
+  handle: VoiceHandle | null,
+  el: HTMLElement,
+  r: DOMRect,
+  x: number,
+  y: number
+): void {
+  endGesture(live, id);
+  if (!handle) return;
+  live.set(id, { handle, x0: x, y0: y, w: r.width, h: r.height, el });
+  // Discrete, not per frame: written once when the press lands and once when it
+  // lifts. `bend` is the honest half — see moveGesture.
+  el.dataset.hold = 'true';
+  el.dataset.bend = handle.canBend ? 'true' : 'false';
+}
+
+/**
+ * The gesture itself: dx in control WIDTHS to pitch, dy in control HEIGHTS to
+ * level. Both scales live in expression.ts, so the feel is tuned in one place.
+ */
+function moveGesture(live: Map<number, Gesture>, id: number, x: number, y: number): void {
+  const g = live.get(id);
+  if (!g) return;
+  // `canBend` is false for a synthesized voice and for any sample still
+  // decoding. The horizontal axis is IGNORED there rather than faked — a bend
+  // that silently does nothing teaches a child a gesture the app will not
+  // honour, which is worse than not offering it.
+  if (g.handle.canBend && g.w > 0) g.handle.bend(gestureToBend((x - g.x0) / g.w));
+  if (g.h > 0) g.handle.level(gestureToLevel((y - g.y0) / g.h));
+}
+
+/** Let go. Idempotent by construction — see the latch note above. */
+function endGesture(live: Map<number, Gesture>, id: number): void {
+  const g = live.get(id);
+  if (!g) return;
+  live.delete(id);
+  delete g.el.dataset.hold;
+  delete g.el.dataset.bend;
+  g.handle.release();
+}
+
+/**
+ * The live gestures of ONE surface, keyed by pointerId so a chord across three
+ * pads is three independent gestures.
+ *
+ * Released on unmount: leaving Party Mode with a finger down must not strand a
+ * held voice, and the map must not outlive the elements it points at.
+ */
+function useGestures(): Map<number, Gesture> {
+  const ref = useRef<Map<number, Gesture> | null>(null);
+  if (ref.current === null) ref.current = new Map();
+  const live = ref.current;
+  useEffect(
+    () => () => {
+      for (const id of Array.from(live.keys())) endGesture(live, id);
+    },
+    [live]
+  );
+  return live;
 }
 
 /* -------------------------------------------------------------- song tile */
@@ -957,6 +1076,7 @@ function LoopSurface({
 
 function BeatsRow() {
   const bm = engine.beatMachine;
+  const live = useGestures();
   // The one legacy layer control left in Party Mode: "fun in one tap" for a
   // child who cannot yet play a beat. It drives the canned groove exactly as
   // before — takes stack on top of it.
@@ -1030,10 +1150,40 @@ function BeatsRow() {
               data-lit-key={slot}
               style={padStyle}
               aria-label={label}
-              onPointerDown={() => bm.drums.tap(slot, 1)}
+              onPointerDown={(e) => {
+                const el = e.currentTarget;
+                // Capture so a finger sliding off the pad keeps feeding this
+                // gesture AND still delivers its release. Guarded: an invalid
+                // pointer id throws, and that must not swallow the hit.
+                try {
+                  el.setPointerCapture(e.pointerId);
+                } catch {
+                  /* capture is an optimisation, not a requirement */
+                }
+                const r = el.getBoundingClientRect();
+                // ONE rect, used twice: hit height decides the velocity the take
+                // RECORDS, and pad width/height scale the gesture that follows.
+                // The gesture is live only — it shapes this sounding voice and
+                // is deliberately not written into the loop.
+                beginGesture(
+                  live,
+                  e.pointerId,
+                  bm.drums.tap(slot, strikeVelocity(r, e.clientY)),
+                  el,
+                  r,
+                  e.clientX,
+                  e.clientY
+                );
+              }}
+              onPointerMove={(e) => moveGesture(live, e.pointerId, e.clientX, e.clientY)}
+              onPointerUp={(e) => endGesture(live, e.pointerId)}
+              onPointerCancel={(e) => endGesture(live, e.pointerId)}
+              onLostPointerCapture={(e) => endGesture(live, e.pointerId)}
               onKeyDown={(e) => {
                 if (e.repeat || (e.key !== 'Enter' && e.key !== ' ')) return;
                 e.preventDefault();
+                // A key press has no coordinates, so it has no gesture and no
+                // strike height either: full velocity, exactly as before.
                 bm.drums.tap(slot, 1);
               }}
             >
@@ -1054,8 +1204,17 @@ function BeatsRow() {
 
 function KeysRow() {
   const bm = engine.beatMachine;
+  const live = useGestures();
   const dragging = useRef(false);
   const lastMidi = useRef(-1);
+  /**
+   * The one pointer driving the bed. The keybed is a single element rather than
+   * twelve, so `lastMidi` is shared; letting a second finger re-strike against
+   * the first one's history would make a two-hand chord fight itself. Gestures
+   * are still keyed by pointerId, so the first finger's note keeps being shaped
+   * and released correctly whatever the second one does.
+   */
+  const owner = useRef(-1);
 
   // The layout is the engine's, not ours: whiteCaps() are the seven scale
   // degrees of the key the room is actually HEARING (anchor deck plus its
@@ -1069,16 +1228,26 @@ function KeysRow() {
   // One path for tap and glissando, mouse and touch. elementFromPoint rather
   // than pointerenter because a touch pointer is implicitly captured by the
   // key it started on and never enters its neighbours.
-  const fireAt = (x: number, y: number) => {
+  //
+  // A slide onto a NEW key re-strikes: beginGesture releases the note being left
+  // before it takes the new handle, so a glissando is a run of notes rather than
+  // a pile of them. The origin moves to the new strike point too — inheriting
+  // the bend a child had dialled in on the previous key would pitch a note they
+  // have only just played.
+  const strike = (id: number, x: number, y: number) => {
     const el = document.elementFromPoint(x, y);
     const key = el instanceof Element ? el.closest<HTMLElement>('[data-midi]') : null;
     if (!key) return;
     const midi = Number(key.dataset.midi);
     if (!Number.isFinite(midi) || midi === lastMidi.current) return;
     lastMidi.current = midi;
+    // Velocity comes from the height of the STRUCK KEY, not of the bed: white
+    // keys are 76px and accidentals 46px, so measuring against the wrong rect
+    // would make every black key read as struck near its bottom.
+    const r = key.getBoundingClientRect();
     // Auto-tune is applied inside tapKey, at TAP time, so the note a child
     // hears the instant they press is the note that gets looped.
-    bm.tapKey(midi, 1);
+    beginGesture(live, id, bm.tapKey(midi, strikeVelocity(r, y)), key, r, x, y);
   };
 
   // Minor keys put an accidental ABOVE the seventh degree — A minor, the
@@ -1175,25 +1344,46 @@ function KeysRow() {
           style={keyStyle}
           onPointerDown={(e) => {
             dragging.current = true;
+            owner.current = e.pointerId;
             lastMidi.current = -1;
-            fireAt(e.clientX, e.clientY);
+            strike(e.pointerId, e.clientX, e.clientY);
           }}
           onPointerMove={(e) => {
-            if (!dragging.current) return;
+            if (!dragging.current || e.pointerId !== owner.current) return;
             if (e.pointerType === 'mouse' && e.buttons === 0) {
+              // The button came up somewhere we never heard about. Ending the
+              // gesture here as well as in the up handlers is what keeps a
+              // released mouse from leaving a note held for the rest of the
+              // party; the latch makes the duplicate harmless.
               dragging.current = false;
+              endGesture(live, e.pointerId);
               return;
             }
-            fireAt(e.clientX, e.clientY);
+            strike(e.pointerId, e.clientX, e.clientY);
+            // Ride the SAME move that may have just re-struck. On a crossing
+            // frame the origin was reset to this exact point, so this is a
+            // no-op; on every other frame it is the bend and the swell.
+            moveGesture(live, e.pointerId, e.clientX, e.clientY);
           }}
-          onPointerUp={() => {
+          onPointerUp={(e) => {
             dragging.current = false;
+            endGesture(live, e.pointerId);
           }}
-          onPointerCancel={() => {
+          onPointerCancel={(e) => {
             dragging.current = false;
+            endGesture(live, e.pointerId);
           }}
-          onPointerLeave={() => {
+          // Mouse only in practice: a touch pointer is implicitly captured by
+          // the key it started on, so it reports no boundary crossings until it
+          // lifts. Leaving the bed with the button down ends the run, exactly as
+          // it did before gestures existed.
+          onPointerLeave={(e) => {
             dragging.current = false;
+            endGesture(live, e.pointerId);
+          }}
+          onLostPointerCapture={(e) => {
+            dragging.current = false;
+            endGesture(live, e.pointerId);
           }}
         >
           {/* --kb-i is the gap this accidental sits in, counted in white keys
@@ -1294,6 +1484,30 @@ export function KidsMode({ onExit }: { onExit: () => void }) {
   // "#NaNNaNNaN" from the lerp below, which kills the whole box-shadow.
   const mix = Number.isFinite(engine.crossfade) ? clamp01(engine.crossfade) : 0.5;
 
+  /* ------------------------------------------------------------ bass swap
+   *
+   * The PERFORMANCE bass swap: song 1's bassline under song 2's vocal, then
+   * flipped. Distinct from the automatic crossfader-driven duck, which is
+   * DEFENSIVE — it exists so two kicks do not become mud, it follows the fader,
+   * and nobody decides it. This one is a decision, which is why the engine pins
+   * 24 dB rather than the automatic 15: it is meant to be HEARD as one.
+   *
+   * The pad's colour is the whole readout. Deck colours are already the
+   * vocabulary of this screen — the Mix fader labels Song 1 cyan and Song 2 pink
+   * — so "the bass pad is pink" says who owns the low end to a child who cannot
+   * read the label, and the neutral slate says the fader is deciding again.
+   *
+   * `engine.decks` is index-stable and `bassOwner` is matched by id, exactly as
+   * applyBassSwap matches it, so the pad and the engine cannot disagree about
+   * who is pinned.
+   */
+  const bassIdx = engine.decks.findIndex((d) => d.id === engine.bassOwner);
+  const bassPinned = bassIdx >= 0;
+  const bassColor = bassPinned ? (COLORS[bassIdx] ?? '#94a3b8') : '#94a3b8';
+  // swapBass() returns early below two loaded decks, so the pad greys out rather
+  // than being a control that silently does nothing.
+  const canSwapBass = engine.decks.filter((d) => d.loaded).length >= 2;
+
   return (
     <div className="min-h-full flex flex-col gap-2 sm:gap-3 p-2 sm:p-3 max-w-5xl mx-auto">
       <header className="flex items-center gap-2">
@@ -1382,7 +1596,23 @@ export function KidsMode({ onExit }: { onExit: () => void }) {
 
         {/* ------------------------------------------------------------- fx */}
         <div className="rack-row">
-          <div className="legend">Magic buttons</div>
+          <div className="legend-bar">
+            <span className="legend">Magic buttons</span>
+            {/* The way BACK. swapBass() flips 1 -> 2 -> 1 and never returns to
+                'auto' by itself, so without this a child who pins the bass can
+                never hand it back to the fader — a one-way door on a toy. It
+                appears only while something is pinned, because a release for
+                nothing is a button that does nothing. */}
+            {bassPinned && (
+              <button
+                className="key key--text key--ghost"
+                onClick={() => engine.setBassOwner('auto')}
+                title="Let the fader decide the bass again"
+              >
+                Bass auto
+              </button>
+            )}
+          </div>
           <div className="well">
             {/* auto-fit at 84px: three across on a phone, six on a tablet, and
                 a seventh pad added later re-flows instead of breaking a row. */}
@@ -1422,6 +1652,18 @@ export function KidsMode({ onExit }: { onExit: () => void }) {
                 color="#f472b6"
                 active={macros.active === 'build'}
                 onPress={() => macros.build()}
+              />
+              {/* Sits with the other performance moves rather than in "Do it for
+                  me": nothing about this is automatic — it is the transition a
+                  DJ makes by hand, and it is what makes a mashup sound
+                  deliberate instead of accidental. */}
+              <BigPad
+                emoji="🎛️"
+                label={bassPinned ? `Bass ${bassIdx + 1}` : 'Bass'}
+                color={bassColor}
+                active={bassPinned}
+                disabled={!canSwapBass}
+                onPress={() => engine.swapBass()}
               />
             </div>
           </div>

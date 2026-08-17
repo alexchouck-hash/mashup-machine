@@ -932,6 +932,34 @@ input[type='range']:disabled {
     --on-text: #e9d5ff;
     --on-glow: rgba(192, 132, 252, 0.45);
   }
+  /* --------------------------------------------- a finger shaping a note */
+  /* data-hold / data-bend are written by beginGesture ONCE per press and
+     removed once per release — never per frame; the gesture itself goes
+     straight to AudioParams and never touches the DOM.
+
+     The ring says the note is still yours. Its COLOUR says which axes answer:
+     the surface accent when the voice can bend, and a dead slate when it
+     cannot — which is the Synth keyboard voice and any sample still decoding.
+     Drawing the confident ring on a voice with no pitch to move would teach a
+     gesture the app cannot honour, and a child who learns a control is a liar
+     stops trying it. --pad is the beat pads' colour and --k the keybed's, so
+     one rule dresses both surfaces with what each already passes.
+
+     outline, not box-shadow: every one of these elements already spends its
+     box-shadow on being a moulded key, and :active spends it again. */
+  .pad[data-hold='true'],
+  .keybed-key[data-hold='true'],
+  .keybed-black[data-hold='true'] {
+    outline: 3px solid var(--pad, var(--k, #e2e8f0));
+    outline-offset: -3px;
+    z-index: 2;
+  }
+  .pad[data-hold='true'][data-bend='false'],
+  .keybed-key[data-hold='true'][data-bend='false'],
+  .keybed-black[data-hold='true'][data-bend='false'] {
+    outline-color: rgba(148, 163, 184, 0.5);
+  }
+
   /* Reset wipes everything a child built, so it asks twice: one tap arms it,
      the second inside 2.6s does it. */
   .key--danger[data-armed='true'] {

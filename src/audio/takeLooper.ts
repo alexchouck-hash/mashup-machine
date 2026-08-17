@@ -1,5 +1,6 @@
 import type { Transport } from './Transport';
 import { saturator } from './drums';
+import { DEAD_HANDLE, type VoiceHandle } from './expression';
 
 /**
  * THE LOOP PEDAL. One mechanism, two surfaces.
@@ -44,15 +45,22 @@ const STEPS_PER_BAR = 16;
 const MERGE_WINDOW_STEPS = 0.25;
 
 /**
- * Live taps are SCHEDULED this far ahead so envelopes open on a block boundary
- * rather than mid-block. 4 ms is a fifth of the flam threshold and reads as
- * instant.
+ * WHY A LIVE TAP NO LONGER SCHEDULES ITSELF 4 ms AHEAD.
  *
- * It is a scheduling artefact, NOT part of the recorded timing: the tap stores
- * the moment the finger landed, so a take played with auto-beat-match off
- * reproduces exactly what was played rather than what the scheduler did with it.
+ * It used to: `LIVE_LEAD_SEC = 0.004` bought envelopes that opened on a block
+ * boundary rather than mid-block. A live tap now plays through the EXPRESSION
+ * path (`voice.playLive`), and those voices build their chain against
+ * `ctx.currentTime` because the handle has to hand back AudioParams that exist
+ * by the time the call returns — a param cannot be scheduled into being.
+ *
+ * The trade is 4 ms of block alignment, which is a fifth of the flam threshold
+ * and inaudible, against a bend that can actually reach the note it is bending.
+ * The RECORDED timing never depended on it either way: the tap stores the moment
+ * the finger landed, not what the scheduler did with it, so a take played with
+ * auto-beat-match off still reproduces exactly what was played.
+ *
+ * The SCHEDULED path is untouched and still exact — see `onStep`.
  */
-const LIVE_LEAD_SEC = 0.004;
 
 /**
  * Per-voice retrigger guard. Pointer events double-fire (pointerdown + click,
@@ -127,6 +135,20 @@ export interface TakeVoice<S> {
    * level (the take's stack trim, or 1 for a live tap); `vel` is 0..1.
    */
   play(ctx: BaseAudioContext, dest: AudioNode, time: number, p: S, gain: number, vel: number): void;
+  /**
+   * Sound ONE hit NOW and hand back a handle a finger still on the control can
+   * bend and swell. MUST NOT THROW — `tap` runs it inside `safely`, but a voice
+   * that throws costs the gesture, so it should not.
+   *
+   * SEPARATE FROM `play` ON PURPOSE, and the separation is the whole point of
+   * the split in drumPacks.ts / melodyVoices.ts: a scheduled hit has no gesture
+   * attached and must not pay for an expression chain it will never use. This is
+   * the only entry point that allocates one.
+   *
+   * Return `DEAD_HANDLE` rather than null when there is nothing to modulate, so
+   * the caller always gets a sound AND a handle whose methods are simply inert.
+   */
+  playLive(ctx: BaseAudioContext, dest: AudioNode, p: S, gain: number, vel: number): VoiceHandle;
   /**
    * Collision identity. Two hits with the same key at the same instant merge to
    * one, and it is also the key the UI lights: `flash` is keyed by this.
@@ -503,24 +525,31 @@ export class TakeLooper<S> {
    * A tap. Sounds NOW and unquantised — the whole feel of a loop pedal is that
    * the instrument never waits for the grid.
    *
-   * Returns false when the guard swallowed it (a pointer double-fire, or a burst
-   * denser than the per-step voice cap), so a caller can decline to light a pad
-   * that did not actually sound.
+   * Returns the sounding voice's HANDLE, so a caller holding a finger down can
+   * bend and swell the note it just struck, or **null** when the guard swallowed
+   * the tap (a pointer double-fire, or a burst denser than the per-step voice
+   * cap) — nothing sounded, so there is nothing to light and nothing to hold.
+   * Null is falsy exactly where the old boolean was false, which is why the
+   * callers that only asked "did it sound?" did not have to change.
+   *
+   * `vel` is the STRUCK velocity and it is what the take records. The gesture
+   * that follows shapes the sounding voice only: a continuous bend curve is a
+   * per-hit automation lane, which is a different and much larger feature.
    */
-  tap(p: S, vel = 1): boolean {
-    if (this.dead) return false;
+  tap(p: S, vel = 1): VoiceHandle | null {
+    if (this.dead) return null;
 
     const key = this.config.voice.keyOf(p);
     const now = this.ctx.currentTime;
 
     const last = this.lastVoiceAt.get(key);
-    if (last !== undefined && now - last < TAP_GUARD_SEC) return false;
+    if (last !== undefined && now - last < TAP_GUARD_SEC) return null;
 
     // Density cap on the live path, matching the one playback obeys: a palm on
     // six pads is six voices, a palm on six pads twice in 40 ms is still six.
     let live = 0;
     for (const t of this.lastVoiceAt.values()) if (now - t < TAP_GUARD_SEC) live++;
-    if (live >= this.config.maxVoicesPerStep) return false;
+    if (live >= this.config.maxVoicesPerStep) return null;
 
     const opening = this.taps.length === 0;
     if (opening) {
@@ -530,11 +559,20 @@ export class TakeLooper<S> {
       this.safely(() => this.hooks.ensureClock());
     }
 
-    const soundAt = now + LIVE_LEAD_SEC;
     const v = clamp(vel, 0, 1);
     this.lastVoiceAt.set(key, now);
-    this.flash.set(key, soundAt);
-    this.safely(() => this.config.voice.play(this.ctx, this.dest, soundAt, p, 1, v));
+    // The live voice starts at ctx.currentTime, so `now` IS the sounding time —
+    // no lead to add back. The pad still lights through the same `flash` channel
+    // the scheduler writes, so a finger-struck pad and a loop-struck pad look
+    // identical.
+    this.flash.set(key, now);
+
+    // A voice that throws must cost this tap, not the surface. `handle` stays
+    // DEAD_HANDLE in that case, so the caller's gesture code is uniform.
+    let handle: VoiceHandle = DEAD_HANDLE;
+    this.safely(() => {
+      handle = this.config.voice.playLive(this.ctx, this.dest, p, 1, v);
+    });
 
     // `at` is when the FINGER landed, not when the voice was scheduled.
     this.taps.push({ at: now, grid: this.clock.gridAt(now), epoch: this.clock.epoch, vel: v, p });
@@ -542,7 +580,7 @@ export class TakeLooper<S> {
 
     // Deliberately no changed() here. A take opening is a per-tap event and the
     // rAF loop already shows it through openRemaining01() and openTaps.
-    return true;
+    return handle;
   }
 
   /** Commit if the idle window has elapsed. Idempotent; safe to call from anywhere. */
